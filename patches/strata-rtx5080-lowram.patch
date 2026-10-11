@@ -1,0 +1,1812 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index dfc249d..d4bc484 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -31,6 +31,7 @@
+ #include <cstddef>
+ #include <condition_variable>
+ #include <deque>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -146,6 +147,11 @@ public:
+     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
+     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
+     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
++    /// `blob`, but nullptr instead of waiting when the blob is still being read (STRATA_POOL_EARLY: the pool computes
++    /// what is here first).  Defaults to `blob`.
++    virtual const uint8_t* blob_if_ready(int64_t layer, int64_t expert) { return blob(layer, expert); }
++    /// STRATA_EXPERT_SKIP: whether the blob is in RAM already or on its way (no new read needed).  Defaults to true.
++    virtual bool has_blob(int64_t layer, int64_t expert) { (void) layer; (void) expert; return true; }
+ 
+     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
+     virtual int64_t reads() const { return 0; }
+@@ -288,6 +294,10 @@ struct GpuPlanSink {
+ /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
+ struct ForesightSwap;
+ 
++/// STRATA_EXPERT_SKIP: the routing weights of the window the verifier is serving (its mapped host copy, published
++/// with Verifier::set_always_publish), set around each pool call; nullptr when not published.
++extern thread_local const float* g_pool_weights;
++
+ struct ExpertDispatch {
+     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
+     strata::kernels::cpu::ExpertPool* pool = nullptr;
+@@ -320,6 +330,7 @@ struct ExpertDispatch {
+     int64_t cache_hits = 0;      ///< lookups already resident
+     int64_t cache_admitted = 0;  ///< lookups that took a slot
+     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
++    int64_t skipped = 0;         ///< STRATA_EXPERT_SKIP: entries left out (their expert in no tier, light)
+     void* cache_stream = nullptr;
+     const char* cache_fail = nullptr;
+ 
+@@ -586,6 +597,22 @@ public:
+     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
+     bool recheck_unbuffered(std::string& why);
+     bool unbuffered() const { return !direct_.empty(); }
++    /// STRATA_PROMPT_DIRECT=1 (Linux; the GGUF in place without a RAM budget): O_DIRECT descriptors for the prompt
++    /// path only - copy_blobs (the prompt stager, the refill after a prompt) reads through read_direct, while the
++    /// mapped reads and the io prefetch keep the file cache.  Under a tight RAM cap the cached reads, not the drive,
++    /// set the prompt's rate.  False (and `why`) when it cannot open them; startup only.
++    bool open_prompt_direct(std::string& why);
++    /// STRATA_EXPERT_MIRROR is open: the direct reads split every layer between the shard and its copy.
++    bool mirrored() const { return mirror_fd_ >= 0; }
++    /// STRATA_DECODE_DIRECT=1 (after open_prompt_direct; the GGUF in place): the decode's blob reads - the read-ahead
++    /// workers and a layer's misses - go through read_direct too, on both drives with STRATA_EXPERT_MIRROR.  The GGUF
++    /// in place assembles every blob in a stage buffer anyway, so no kernel reads those pages from the file cache.
++    void set_decode_direct(bool on) { decode_direct_ = on && !pp_direct_.empty() && !role_ptr_.empty(); }
++    bool decode_direct() const { return decode_direct_; }
++    /// STRATA_STAGE_KEEP=N: the stage pool grows to N buffers before it reuses one, so the last N blobs read stay in
++    /// RAM (with direct reads nothing else keeps them).  The buffers are sized exactly per blob size, and each size
++    /// keeps its share of N (by the layers that have it): N x the mean blob of RAM.  0 (the default): as before.
++    void set_stage_keep(size_t n);
+     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
+     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
+     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
+@@ -601,6 +628,8 @@ public:
+     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
+ 
+     const uint8_t* blob(int64_t layer, int64_t expert) override;
++    const uint8_t* blob_if_ready(int64_t layer, int64_t expert) override;
++    bool has_blob(int64_t layer, int64_t expert) override;
+     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
+     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
+     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
+@@ -657,6 +686,9 @@ public:
+         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
+         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
+         uint64_t crit_n = 0;
++        uint64_t hand_hit = 0, hand_late = 0, hand_late_us = 0;   ///< decode hand-out: staged already / still being read (wait)
++        uint64_t hand_now = 0, hand_now_us = 0, hand_now_calls = 0; ///< read on the spot by the layer (prefetch's fill_many)
++        uint64_t rd_io_us = 0, rd_copy_us = 0, rd_n = 0;           ///< the decode's direct reads: drive wait, bounce copy
+     };
+     IoCounters io_counters() const;
+ 
+@@ -664,7 +696,8 @@ private:
+     const uint8_t* resident_blob(size_t index) const;
+     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
+     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
+-    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
++    /// `stage_dst`: dst is a stage buffer (4 KiB-aligned, whole 4 KiB blocks: a packed blob may be read straight in).
++    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst = false) const;
+     bool open_gguf(std::string& err);
+     const uint8_t* staged_blob(int64_t layer, int64_t expert);
+     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
+@@ -675,10 +708,26 @@ private:
+     void fill_many(const std::vector<Fill>& todo);
+     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
+     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
+-    bool read_direct(const Fill* fills, size_t n) const;
++    /// `decode`: the decode's scattered blobs (STRATA_EXPERT_MIRROR_DECODE_SHARE splits them), else the prompt's.
++    bool read_direct(const Fill* fills, size_t n, bool decode = false, bool stage_dst = false) const;
+     bool open_direct(std::string& why);
+     std::vector<std::string> paths_;          ///< the mapped files, as maps_
+     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
++    std::vector<void*> pp_direct_;            ///< open_prompt_direct: per file, an O_DIRECT fd for copy_blobs only
++    int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
++    int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
++    int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
++    int64_t mirror_cut_decode_ = 0;           ///< the same for the decode's reads (STRATA_EXPERT_MIRROR_DECODE_SHARE)
++    bool packed_ = false;                     ///< the copy is expert_pack.py's: whole blobs from packed_first_ on
++    int64_t packed_first_ = 0;
++    std::vector<uint64_t> packed_off_, packed_stride_;   ///< per layer: its first blob's offset, the blob stride
++    bool decode_direct_ = false;              ///< set_decode_direct
++    size_t stage_keep_ = 0;                   ///< set_stage_keep
++    std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
++    std::map<uint64_t, size_t> stage_class_keep_;              ///< STRATA_STAGE_KEEP: buffers kept per blob size
++    std::map<uint64_t, std::vector<size_t>> stage_class_bufs_; ///< STRATA_STAGE_KEEP: the buffers of each blob size
++    bool open_mirror(const std::string& path, double share, std::string& err);
++    bool open_packed(const std::string& path, std::string& err);
+     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
+     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
+@@ -740,12 +789,15 @@ private:
+     std::mutex io_mu_;
+     std::condition_variable io_cv_;
+     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
++    std::deque<Fill> io_now_q_;                      ///< STRATA_DECODE_DIRECT: a layer's claimed blobs, read before io_q_
+     bool io_quit_ = false;
+     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
+     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
+     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
+         io_crit_us_{0}, io_crit_n_{0};
++    mutable std::atomic<uint64_t> hand_hit_{0}, hand_late_{0}, hand_late_us_{0}, hand_now_{0}, hand_now_us_{0}, hand_now_calls_{0};
++    mutable std::atomic<uint64_t> rd_io_us_{0}, rd_copy_us_{0}, rd_n_{0};
+     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
+     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
+     int spans(int64_t layer, int64_t expert, Span* out) const;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index e4b4649..1c01644 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -24,6 +24,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <cmath>
+ #include <deque>
+ #include <fstream>
+ #include <filesystem>
+@@ -554,6 +555,9 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
+     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
+     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
+     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
++    c.hand_hit = hand_hit_.load(); c.hand_late = hand_late_.load(); c.hand_late_us = hand_late_us_.load();
++    c.hand_now = hand_now_.load(); c.hand_now_us = hand_now_us_.load(); c.hand_now_calls = hand_now_calls_.load();
++    c.rd_io_us = rd_io_us_.load(); c.rd_copy_us = rd_copy_us_.load(); c.rd_n = rd_n_.load();
+     return c;
+ }
+ 
+@@ -603,6 +607,15 @@ void FileExpertSource::io_stop() {
+     for (std::thread& t : io_workers_)
+         if (t.joinable()) t.join();
+     io_workers_.clear();
++    for (std::deque<Fill> left; ;) {   // claimed blobs a layer waits for: read them here
++        {
++            std::lock_guard<std::mutex> lk(io_mu_);
++            left.swap(io_now_q_);
++        }
++        if (left.empty()) break;
++        for (const Fill& f : left) (void) fill_stage(f.v, f.layer, f.e, f.dst);
++        left.clear();
++    }
+ #if defined(__linux__)
+     for (int f : io_fds_) ::close(f);
+ #endif
+@@ -630,8 +643,15 @@ void FileExpertSource::io_worker() {
+         int32_t layer, expert;
+         {
+             std::unique_lock<std::mutex> lk(io_mu_);
+-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
++            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_now_q_.empty(); });
+             if (io_quit_) return;
++            if (!io_now_q_.empty()) {   // a layer is waiting for this one (prefetch handed it over, claimed)
++                const Fill f = io_now_q_.front();
++                io_now_q_.pop_front();
++                lk.unlock();
++                (void) fill_stage(f.v, f.layer, f.e, f.dst);
++                continue;
++            }
+             layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+             expert = io_q_.back().second;
+             io_q_.pop_back();
+@@ -664,7 +684,7 @@ void FileExpertSource::io_worker() {
+             continue;
+         }
+         uint64_t total = 0;
+-        if (cached_bytes(layer, expert, total, false) >= total) {
++        if (!decode_direct_ && cached_bytes(layer, expert, total, false) >= total) {   // direct: never cached
+             io_pf_skips_.fetch_add(1, std::memory_order_relaxed);
+             continue;
+         }
+@@ -679,7 +699,7 @@ void FileExpertSource::io_worker() {
+             stage_pf_[v] = 1;
+             dst = stage_buf_[v].get();
+         }
+-        const bool ok = copy_from_files(layer, expert, dst);
++        const bool ok = copy_from_files(layer, expert, dst, true);
+         io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
+         if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+         {
+@@ -956,6 +976,13 @@ void FileExpertSource::close() {
+     paths_.clear();
+     for (void* h : direct_) close_direct(h);
+     direct_.clear();
++    for (void* h : pp_direct_) close_direct(h);
++    pp_direct_.clear();
++#if defined(__linux__)
++    if (mirror_fd_ >= 0) ::close(mirror_fd_);
++#endif
++    mirror_fd_ = mirror_main_ = -1;
++    packed_ = false;
+     {
+         std::lock_guard<std::mutex> lk(stage_mu_);
+         stage_buf_.clear();
+@@ -963,6 +990,8 @@ void FileExpertSource::close() {
+         stage_epoch_.clear();
+         stage_used_.clear();
+         stage_busy_.clear();
++        stage_cap_.clear();
++        stage_class_bufs_.clear();
+         stage_pf_.clear();
+         stage_of_.clear();
+         stage_blob_ = 0;
+@@ -1096,17 +1125,26 @@ bool FileExpertSource::open_gguf(std::string& err) {
+             role_bytes_[i] = per[r];
+         }
+     }
++    // STRATA_EXPERT_MIRROR=<file> (opt-in, Linux): a copy of this shard on a second drive - whole, or holding only the
++    // experts it serves (tools/rtx5080/expert_mirror.py).  The direct reads (read_direct: STRATA_PROMPT_DIRECT=1, or an
++    // unbuffered file tier) take every layer's experts from mirror_cut_ on from it - STRATA_EXPERT_MIRROR_SHARE of
++    // them, default 0.5 - so both drives serve each layer at once (the prompt stager finishes a layer before it
++    // starts the next).  The mapped reads stay on the shard.  Same bytes at the same offsets, so the same answers.
++    if (const char* mv = std::getenv("STRATA_EXPERT_MIRROR"); mv != nullptr && mv[0] != '\0') {
++        const char* sv = std::getenv("STRATA_EXPERT_MIRROR_SHARE");
++        if (!open_mirror(mv, sv != nullptr ? std::atof(sv) : 0.5, err)) return false;
++    }
+     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
+     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+     return true;
+ }
+ 
+-bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
++bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst) const {
+     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+-    if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
++    if (!direct_.empty() || decode_direct_) {   // #286: from the drive; a failed read falls back to the mapping below
+         const Fill f{0, layer, expert, dst};
+-        if (read_direct(&f, 1)) return true;
++        if (read_direct(&f, 1, true, stage_dst)) return true;
+         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+     }
+ #if defined(__linux__)
+@@ -1156,7 +1194,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
+ constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
+ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
+     if (pinned) (void) cudaFreeHost(p);
+-    else delete[] p;
++    else std::free(p);   // posix_memalign (claim_stage)
+ }
+ 
+ // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
+@@ -1180,12 +1218,23 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+     }
+     v = stage_buf_.size();
+     uint64_t oldest = std::numeric_limits<uint64_t>::max();
+-    for (size_t i = 0; i < stage_buf_.size(); ++i)
++    // STRATA_STAGE_KEEP: each blob size grows to its share of stage_keep_ buffers, exactly that size, before it reuses
++    // one of its own (the oldest), so the pool keeps the last blobs read; otherwise any buffer, as before
++    const auto ck = stage_class_keep_.find(layer_blob_bytes_[(size_t) (key / n_expert_)]);
++    const bool keep = ck != stage_class_keep_.end();
++    const uint64_t need = keep ? ck->first : stage_blob_;
++    std::vector<size_t>* mine = keep ? &stage_class_bufs_[need] : nullptr;
++    auto victim = [&](size_t i) {
+         if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
+             stage_used_[i] < oldest) {
+             oldest = stage_used_[i];
+             v = i;
+         }
++    };
++    if (!keep)
++        for (size_t i = 0; i < stage_buf_.size(); ++i) victim(i);
++    else if (mine->size() >= ck->second)
++        for (size_t i : *mine) victim(i);
+     if (v == stage_buf_.size()) {
+         // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
+         // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
+@@ -1201,12 +1250,17 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+         }
+         void* p = nullptr;
+         cudaError_t pin_err = cudaSuccess;
+-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
++        // 4 KiB-aligned and whole 4 KiB blocks: a packed copy's blob is read straight in (read_direct, stage_dst)
++        const size_t alloc = (size_t) ((need + 4095) / 4096 * 4096);
++        if (want_pin) pin_err = cudaHostAlloc(&p, alloc, cudaHostAllocDefault);
+         const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
+         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
+-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
++        void* q = nullptr;
++        uint8_t* raw = pinned ? (uint8_t*) p : (posix_memalign(&q, 4096, alloc) == 0 ? (uint8_t*) q : nullptr);
+         if (raw == nullptr) return false;
+         stage_buf_.emplace_back(raw, StageBufFree{pinned});
++        stage_cap_.push_back(need);
++        if (mine != nullptr) mine->push_back(stage_buf_.size() - 1);
+         if (pinned && !stage_pin_said_) {
+             stage_pin_said_ = true;
+             std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
+@@ -1241,7 +1295,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+ // Fills buffer `v` (reserved by claim_stage) outside the lock, then publishes it.
+ bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst) {
+     const auto t0 = std::chrono::steady_clock::now();
+-    const bool ok = copy_from_files(layer, expert, dst);
++    const bool ok = copy_from_files(layer, expert, dst, true);
+     publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+     return ok;
+ }
+@@ -1282,7 +1336,15 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
+         dst = stage_buf_[v].get();
+         if (have) {
+             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
+-            stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
++            if (stage_busy_[v]) {
++                const auto w0 = std::chrono::steady_clock::now();
++                stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
++                hand_late_.fetch_add(1, std::memory_order_relaxed);
++                hand_late_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - w0).count(),
++                                        std::memory_order_relaxed);
++            } else {
++                hand_hit_.fetch_add(1, std::memory_order_relaxed);
++            }
+             if (stage_key_[v] != key) return nullptr;   // its fill failed
+             lk.unlock();
+             crit();
+@@ -1346,7 +1408,26 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
+             }
+         }
+     }
++    const auto f0 = std::chrono::steady_clock::now();
++    if (decode_direct_ && io_pf_ && !io_workers_.empty() && !todo.empty()) {
++        // STRATA_DECODE_DIRECT: the read-ahead workers read the layer's blobs in parallel, ahead of their predictions
++        // (one thread read them one batch at a time, then copied each out of its bounce buffer); staged_blob waits
++        {
++            std::lock_guard<std::mutex> lk(io_mu_);
++            for (const Fill& f : todo) io_now_q_.push_back(f);
++        }
++        io_cv_.notify_all();
++        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
++        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
+     fill_many(todo);
++    if (!todo.empty()) {
++        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
++        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
++        hand_now_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - f0).count(),
++                               std::memory_order_relaxed);
++    }
+     if (io_pf_ && !todo.empty()) {
+         io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                               std::memory_order_relaxed);
+@@ -1389,7 +1470,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
+ 
+ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
+     if (todo.empty()) return;
+-    if (!direct_.empty()) {
++    if (!direct_.empty() || decode_direct_) {
+         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
+         // fill) on up to 4 threads, a decode layer's few misses on this one
+         std::atomic<size_t> next{0};
+@@ -1397,7 +1478,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
+             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
+                 const size_t k = std::min<size_t>(16, todo.size() - at);
+                 const auto t0 = std::chrono::steady_clock::now();
+-                const bool ok = read_direct(todo.data() + at, k);
++                const bool ok = read_direct(todo.data() + at, k, true, true);
+                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                 for (size_t i = at; i < at + k; ++i) {
+                     const Fill& f = todo[i];
+@@ -1502,6 +1583,180 @@ bool FileExpertSource::open_direct(std::string& why) {
+ #endif
+ }
+ 
++bool FileExpertSource::open_mirror(const std::string& path, double share, std::string& err) {
++#if defined(__linux__)
++    for (size_t f = 0; f < paths_.size(); ++f)
++        if (paths_[f] == gguf_) mirror_main_ = (int) f;
++    if (mirror_main_ < 0) { err = "STRATA_EXPERT_MIRROR: no experts in " + gguf_; return false; }
++    mirror_cut_ = n_expert_ - std::llround((double) n_expert_ * std::clamp(share, 0.0, 1.0));
++    {
++        // tools/rtx5080/expert_pack.py's layout: every served expert's blob (gate, up, down) in one 4 KiB-aligned piece
++        const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++        char magic[8] = {};
++        const bool is_pack = fh >= 0 && ::pread(fh, magic, 8, 0) == 8 && std::memcmp(magic, "STRPACK1", 8) == 0;
++        if (fh >= 0) ::close(fh);
++        if (is_pack) return open_packed(path, err);
++    }
++    struct stat a{}, b{};
++    if (::stat(gguf_.c_str(), &a) != 0 || ::stat(path.c_str(), &b) != 0 || a.st_size != b.st_size) {
++        err = "STRATA_EXPERT_MIRROR: " + path + " is missing or not the size of " + gguf_;
++        mirror_main_ = -1;
++        return false;
++    }
++    // a copy made for a smaller share has holes where these experts are: compare the first and last 4 KiB of every
++    // role's served range with the shard (a hole reads as zeros, and would compute with them)
++    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC), fm = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    bool same = fs >= 0 && fm >= 0;
++    int64_t bad_layer = -1;
++    std::vector<uint8_t> x(4096), y(4096);
++    for (int64_t l = 0; same && l < n_layers_ && mirror_cut_ < n_expert_; ++l)
++        for (int r = 0; same && r < 3; ++r) {
++            const size_t i = (size_t) (3 * l + r);
++            if (role_file_[i] != mirror_main_) continue;
++            const uint64_t per = role_bytes_[i], off = (uint64_t) (role_ptr_[i] - maps_[(size_t) mirror_main_].base);
++            const uint64_t lo = off + (uint64_t) mirror_cut_ * per, hi = off + (uint64_t) n_expert_ * per;
++            const size_t k = (size_t) std::min<uint64_t>(4096, hi - lo);
++            for (const uint64_t at : {lo, hi - k}) {
++                if (!pread_full(fs, x.data(), k, at) || !pread_full(fm, y.data(), k, at) || std::memcmp(x.data(), y.data(), k) != 0) {
++                    same = false;
++                    bad_layer = l;
++                    break;
++                }
++            }
++        }
++    if (fs >= 0) ::close(fs);
++    if (fm >= 0) ::close(fm);
++    if (same) mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    if (!same || mirror_fd_ < 0) {
++        err = !same ? "STRATA_EXPERT_MIRROR: " + path + " does not hold experts " + std::to_string(mirror_cut_) + ".. of layer " +
++                          std::to_string(bad_layer) + " as " + gguf_ + " does (made for a smaller STRATA_EXPERT_MIRROR_SHARE?)"
++                    : "STRATA_EXPERT_MIRROR: cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
++        mirror_fd_ = mirror_main_ = -1;
++        return false;
++    }
++    {
++        // scattered 2 MB reads (the decode's) run at about the same rate on both drives even where one is the faster at
++        // long ones, so the decode may split them differently from the prompt
++        const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE");
++        const double ds = dv != nullptr ? std::clamp(std::atof(dv), 0.0, 1.0) : std::clamp(share, 0.0, 1.0);
++        mirror_cut_decode_ = std::max(mirror_cut_, n_expert_ - (int64_t) std::llround((double) n_expert_ * ds));
++    }
++    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from the mirror %s\n",
++                 (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
++    return true;
++#else
++    (void) path; (void) share;
++    err = "STRATA_EXPERT_MIRROR: Linux only";
++    return false;
++#endif
++}
++
++void FileExpertSource::set_stage_keep(size_t n) {
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    stage_keep_ = n;
++    stage_class_keep_.clear();
++    if (n == 0 || n_layers_ <= 0 || (int64_t) layer_blob_bytes_.size() < n_layers_) return;
++    std::map<uint64_t, size_t> layers;
++    for (int64_t l = 0; l < n_layers_; ++l) ++layers[layer_blob_bytes_[(size_t) l]];
++    for (const auto& [bytes, count] : layers) stage_class_keep_[bytes] = std::max<size_t>(1, n * count / (size_t) n_layers_);
++}
++
++bool FileExpertSource::open_packed(const std::string& path, std::string& err) {
++#if defined(__linux__)
++    auto fail = [&](const std::string& why) { err = "STRATA_EXPERT_MIRROR: " + path + ": " + why; mirror_main_ = -1; return false; };
++    const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fh < 0) return fail("cannot open it");
++    std::vector<uint8_t> h((size_t) (40 + 24 * n_layers_));
++    const bool got = pread_full(fh, h.data(), h.size(), 0);
++    uint32_t ver = 0, nl = 0, ne = 0, first = 0;
++    uint64_t shard = 0;
++    if (got) {
++        std::memcpy(&ver, h.data() + 8, 4); std::memcpy(&nl, h.data() + 12, 4);
++        std::memcpy(&ne, h.data() + 16, 4); std::memcpy(&first, h.data() + 20, 4); std::memcpy(&shard, h.data() + 24, 8);
++    }
++    struct stat a{};
++    if (!got || ver != 1 || (int64_t) nl != n_layers_ || (int64_t) ne != n_expert_ || ::stat(gguf_.c_str(), &a) != 0 ||
++        (uint64_t) a.st_size != shard) {
++        ::close(fh);
++        return fail("its header does not match " + gguf_ + " (another model or quant?)");
++    }
++    packed_first_ = first;
++    packed_off_.assign((size_t) n_layers_, 0);
++    packed_stride_.assign((size_t) n_layers_, 0);
++    for (int64_t l = 0; l < n_layers_; ++l) {
++        uint64_t blob = 0;
++        std::memcpy(&blob, h.data() + 32 + 24 * l, 8);
++        std::memcpy(&packed_stride_[(size_t) l], h.data() + 40 + 24 * l, 8);
++        std::memcpy(&packed_off_[(size_t) l], h.data() + 48 + 24 * l, 8);
++        bool here = true;
++        for (int r = 0; r < 3; ++r) here = here && role_file_[(size_t) (3 * l + r)] == mirror_main_;
++        if (blob != layer_blob_bytes_[(size_t) l] || !here || packed_stride_[(size_t) l] % 4096 != 0 ||
++            packed_off_[(size_t) l] % 4096 != 0) {
++            ::close(fh);
++            return fail("layer " + std::to_string(l) + " does not match the engine's blobs");
++        }
++    }
++    mirror_cut_decode_ = mirror_cut_;
++    if (const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE"); dv != nullptr)
++        mirror_cut_decode_ = n_expert_ - (int64_t) std::llround((double) n_expert_ * std::clamp(std::atof(dv), 0.0, 1.0));
++    if (std::min(mirror_cut_, mirror_cut_decode_) < packed_first_) {
++        ::close(fh);
++        return fail("it holds experts " + std::to_string(packed_first_) + ".. only (made for a smaller share)");
++    }
++    // spot check: every layer's first and last served blob against the shard (its first and last 4 KiB)
++    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC);
++    bool same = fs >= 0;
++    std::vector<uint8_t> x(4096), y(4096);
++    for (int64_t l = 0; same && l < n_layers_; ++l)
++        for (const int64_t e : {packed_first_, n_expert_ - 1}) {
++            const uint64_t at = packed_off_[(size_t) l] + (uint64_t) (e - packed_first_) * packed_stride_[(size_t) l];
++            const size_t g = (size_t) (3 * l), d3 = (size_t) (3 * l + 2);
++            const uint64_t g0 = (uint64_t) (role_ptr_[g] - maps_[(size_t) mirror_main_].base) + (uint64_t) e * role_bytes_[g];
++            const uint64_t d1 = (uint64_t) (role_ptr_[d3] - maps_[(size_t) mirror_main_].base) + (uint64_t) (e + 1) * role_bytes_[d3];
++            const size_t kg = (size_t) std::min<uint64_t>(4096, role_bytes_[g]), kd = (size_t) std::min<uint64_t>(4096, role_bytes_[d3]);
++            same = pread_full(fs, x.data(), kg, g0) && pread_full(fh, y.data(), kg, at) && std::memcmp(x.data(), y.data(), kg) == 0 &&
++                   pread_full(fs, x.data(), kd, d1 - kd) && pread_full(fh, y.data(), kd, at + layer_blob_bytes_[(size_t) l] - kd) &&
++                   std::memcmp(x.data(), y.data(), kd) == 0;
++            if (!same) { err = "layer " + std::to_string(l) + " expert " + std::to_string(e); break; }
++        }
++    if (fs >= 0) ::close(fs);
++    ::close(fh);
++    if (!same) return fail("its bytes differ from the shard at " + err);
++    mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    if (mirror_fd_ < 0) return fail(std::string("cannot open it with O_DIRECT (") + std::strerror(errno) + ")");
++    packed_ = true;
++    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from "
++                         "the packed copy %s, one read per expert\n", (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
++    return true;
++#else
++    (void) path;
++    err = "STRATA_EXPERT_MIRROR: Linux only";
++    return false;
++#endif
++}
++
++bool FileExpertSource::open_prompt_direct(std::string& why) {
++#if defined(__linux__)
++    if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
++    if (paths_.empty()) { why = "no expert files open"; return false; }
++    for (const std::string& path : paths_) {
++        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++        if (fd < 0) {
++            why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
++            for (void* d : pp_direct_) close_direct(d);
++            pp_direct_.clear();
++            return false;
++        }
++        pp_direct_.push_back((void*) (intptr_t) fd);
++    }
++    why = "the prompt's expert copies and the refill after it read straight from the drive";
++    return true;
++#else
++    why = "Linux only";
++    return false;
++#endif
++}
++
+ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
+ #if defined(_WIN32) || defined(__linux__)
+     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
+@@ -1574,7 +1829,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
+ #endif
+ }
+ 
+-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
++bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode, bool stage_dst) const {
+ #if defined(_WIN32)
+     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
+     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
+@@ -1696,8 +1951,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     // own context and aligned buffer, kept for its next batch, so concurrent batches never see each other's events.
+     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
+     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
+-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
+-    struct Req { int fd; uint64_t a0, size, pos; };
++    constexpr int kMirror = 1 << 30;   // Window::file of a read from STRATA_EXPERT_MIRROR's copy (mirror_fd_)
++    // to_dst: the window is read straight into dst (a packed blob into its stage buffer), not through the bounce buffer
++    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; bool to_dst = false; };
++    struct Req { int fd; uint64_t a0, size, pos; uint8_t* to; };
+     struct Scratch {
+         uint8_t* buf = nullptr;
+         size_t cap = 0;
+@@ -1715,6 +1972,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+         }
+     };
+     thread_local Scratch sc;
++    const std::vector<void*>& dv = direct_.empty() ? pp_direct_ : direct_;   // open_prompt_direct's when not unbuffered
++    if (dv.empty()) return false;
+     if (sc.ctx == 0 && syscall(SYS_io_setup, kDepth, &sc.ctx) != 0) {
+         sc.ctx = 0;
+         return false;   // no AIO (a seccomp profile, aio-max-nr): the caller falls back to the mapped copy
+@@ -1730,6 +1989,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
+             continue;
+         }
++        if (packed_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_)) {   // expert_pack.py: the blob in one piece
++            const uint64_t at0 = packed_off_[(size_t) f.layer] + (uint64_t) (f.e - packed_first_) * packed_stride_[(size_t) f.layer];
++            sc.win.push_back({kMirror, at0, packed_stride_[(size_t) f.layer], 0, layer_blob_bytes_[(size_t) f.layer], 0, f.dst, 0, 0,
++                              stage_dst && ((uintptr_t) f.dst & 4095) == 0});
++            continue;
++        }
+         uint64_t at = 0;
+         for (int r = 0; r < 3; ++r) {
+             const size_t i = (size_t) (3 * f.layer + r);
+@@ -1737,7 +2002,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             const Map& m = maps_[(size_t) role_file_[i]];
+             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
+             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
+-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
++            int file = role_file_[i];
++            if (!packed_ && mirror_fd_ >= 0 && file == mirror_main_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_))
++                file = kMirror;   // same bytes, same offset
++            sc.win.push_back({file, a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
+             at += per;
+         }
+     }
+@@ -1751,7 +2019,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     int last_file = -1;
+     for (size_t w : sc.order) {
+         Window& x = sc.win[w];
+-        if (!sc.req.empty() && x.file == last_file) {
++        if (x.to_dst) {   // its own request, into its stage buffer
++            sc.req.push_back({mirror_fd_, x.a0, x.size, 0, x.dst});
++            last_file = -2;
++            x.req = sc.req.size() - 1;
++            x.in_req = 0;
++            continue;
++        }
++        if (!sc.req.empty() && x.file == last_file && sc.req.back().to == nullptr) {
+             Req& q = sc.req.back();
+             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
+             if (x.a0 <= end && std::max(end, xend) - q.a0 <= kMerge) {
+@@ -1764,7 +2039,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+                 continue;
+             }
+         }
+-        sc.req.push_back({(int) (intptr_t) direct_[(size_t) x.file], x.a0, x.size, total});
++        sc.req.push_back({x.file == kMirror ? mirror_fd_ : (int) (intptr_t) dv[(size_t) x.file], x.a0, x.size, total, nullptr});
+         total += x.size;
+         last_file = x.file;
+         x.req = sc.req.size() - 1;
+@@ -1782,6 +2057,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     sc.cbp.resize(sc.cb.size());
+     sc.ev.resize(sc.cb.size());
+     bool ok = true;
++    const auto rd_t0 = std::chrono::steady_clock::now();
+     for (size_t w0 = 0; ok && w0 < sc.req.size(); w0 += (size_t) kDepth) {
+         const size_t wn = std::min<size_t>((size_t) kDepth, sc.req.size() - w0);
+         for (size_t j = 0; j < wn; ++j) {
+@@ -1790,7 +2066,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             std::memset(&c, 0, sizeof c);
+             c.aio_lio_opcode = IOCB_CMD_PREAD;
+             c.aio_fildes = (uint32_t) r.fd;
+-            c.aio_buf = (uint64_t) (uintptr_t) (sc.buf + r.pos);
++            c.aio_buf = (uint64_t) (uintptr_t) (r.to != nullptr ? r.to : sc.buf + r.pos);
+             c.aio_nbytes = r.size;
+             c.aio_offset = (int64_t) r.a0;
+             c.aio_data = (uint64_t) (w0 + j);
+@@ -1824,11 +2100,19 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+         }
+     }
+     if (!ok) return false;
++    const auto rd_t1 = std::chrono::steady_clock::now();
+     for (const Window& x : sc.win) {
+         // a request may run past the end of the file: only the role's own bytes have to arrive
+         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
++        if (x.to_dst) continue;   // already in place
+         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+     }
++    if (decode) {
++        const auto rd_t2 = std::chrono::steady_clock::now();
++        rd_io_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t1 - rd_t0).count(), std::memory_order_relaxed);
++        rd_copy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t2 - rd_t1).count(), std::memory_order_relaxed);
++        rd_n_.fetch_add(n, std::memory_order_relaxed);
++    }
+     return true;
+ #else
+     (void) fills; (void) n;
+@@ -2084,12 +2368,48 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+ // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
+ // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
+ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+-    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
++    // unbuffered: one blob goes through copy_blob (copy_from_files reads it directly); prompt-only: copy_blob reads
++    // through the file cache, so every batch comes here
++    if (direct_.empty() ? pp_direct_.empty() : n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+     thread_local std::vector<Fill> fills;
+     fills.clear();
+     uint64_t bytes = 0;
++    // STRATA_STAGE_KEEP: the blobs the stage pool still holds (the decode's recent misses) are copied from RAM.  Each is
++    // marked busy while it is copied, as a fill would be, so claim_stage cannot hand the buffer out under the copy; a
++    // buffer still being filled is read from the drive instead
++    thread_local std::vector<size_t> held;   // per blob: its stage buffer, or SIZE_MAX
++    thread_local std::vector<const uint8_t*> from;   // that buffer's bytes (taken under the lock: the pool may grow)
++    held.assign(n, SIZE_MAX);
++    from.assign(n, nullptr);
++    if (stage_keep_ > 0) {
++        bool any = false;
++        {
++            std::lock_guard<std::mutex> lk(stage_mu_);
++            for (size_t i = 0; i < n; ++i) {
++                if (layers[i] < 0 || experts[i] < 0 || layers[i] >= n_layers_ || experts[i] >= n_expert_) continue;
++                const auto it = stage_of_.find((int64_t) layers[i] * n_expert_ + experts[i]);
++                if (it == stage_of_.end() || stage_busy_[it->second]) continue;
++                stage_busy_[it->second] = 1;
++                held[i] = it->second;
++                from[i] = stage_buf_[it->second].get();
++                any = true;
++            }
++        }
++        if (any) {
++            for (size_t i = 0; i < n; ++i)
++                if (held[i] != SIZE_MAX && dst[i] != nullptr)
++                    std::memcpy(dst[i], from[i], (size_t) layer_blob_bytes_[(size_t) layers[i]]);
++            {
++                std::lock_guard<std::mutex> lk(stage_mu_);
++                for (size_t i = 0; i < n; ++i)
++                    if (held[i] != SIZE_MAX) stage_busy_[held[i]] = 0;
++            }
++            stage_cv_.notify_all();
++        }
++    }
+     for (size_t i = 0; i < n; ++i) {
+         const int64_t l = layers[i], e = experts[i];
++        if (held[i] != SIZE_MAX) continue;
+         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
+         const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
+         if (complement_ready_ &&
+@@ -2906,6 +3226,34 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
+     return blob(layer, expert);
+ }
+ 
++thread_local const float* g_pool_weights = nullptr;
++
++bool FileExpertSource::has_blob(int64_t layer, int64_t expert) {
++    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return true;
++    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    if (complement_ready_ && resident_blob(index) != nullptr) return true;
++    if (!override_.empty() && override_[index] != nullptr) return true;
++    if (!staged()) return true;
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    return stage_of_.find(layer * n_expert_ + expert) != stage_of_.end();   // staged, or being read
++}
++
++const uint8_t* FileExpertSource::blob_if_ready(int64_t layer, int64_t expert) {
++    // only a staged blob can be "not here yet"; every other kind of hand-out is what blob() does
++    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_ || complement_ready_ ||
++        !staged() || (io_pf_ && role_ptr_.empty() && direct_.empty()))
++        return blob(layer, expert);
++    const int64_t key = layer * n_expert_ + expert;
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    const auto it = stage_of_.find(key);
++    if (it == stage_of_.end() || stage_busy_[it->second]) return nullptr;   // still being read: the caller asks blob() later
++    size_t v = 0;
++    bool fill = false;
++    (void) claim_stage(key, v, fill);   // as staged_blob: refreshes its age, so the pointer holds for this layer
++    hand_hit_.fetch_add(1, std::memory_order_relaxed);
++    return stage_buf_[v].get();
++}
++
+ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
+     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+@@ -3269,9 +3617,27 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
+     static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
++    // STRATA_EXPERT_SKIP=W: a CPU expert no tier holds (nor is reading) whose weight is below W for every token routed
++    // to it here is skipped (kind -3: its rows are zero, nothing is read) - changes the output, opt-in
++    static const float skip_w = [] { const char* v = std::getenv("STRATA_EXPERT_SKIP"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
++    if (skip_w > 0.0f && g_pool_weights != nullptr) {
++        const float* w = g_pool_weights;
++        for (int64_t i = 0; i < n; ++i) {
++            if (kind[i] != -1 || ids[i] < 0 || ids[i] >= d.n_expert) continue;
++            bool first = true, light = true;
++            for (int64_t j = 0; j < n && light; ++j)
++                if (ids[j] == ids[i] && kind[j] < 0) {
++                    if (j < i) first = false;
++                    if (w[j] >= skip_w) light = false;
++                }
++            if (!first || !light || d.src->has_blob(d.layers, ids[i])) continue;
++            for (int64_t j = i; j < n; ++j)
++                if (ids[j] == ids[i] && kind[j] == -1) { kind[j] = -3; ++d.skipped; }
++        }
++    }
+     bool any_cpu = false;
+     for (int64_t i = 0; i < n; ++i)
+-        if (kind[i] < 0) { any_cpu = true; break; }
++        if (kind[i] == -1) { any_cpu = true; break; }
+     const auto c1 = std::chrono::steady_clock::now();
+     if (any_cpu) {
+         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
+@@ -3291,12 +3657,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         static thread_local std::vector<int64_t> miss;
+         miss.clear();
+         for (int64_t i = 0; i < n_tok * k; ++i)
+-            if (kind[i] < 0 && ids[i] >= 0 && ids[i] < d.n_expert &&
++            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
+                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
+                 miss.push_back(ids[i]);
+         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+     }
+     int njobs = 0;
++    // STRATA_POOL_EARLY=1: the experts whose blobs are here are computed first, while the rest are still being read
++    static const bool early = [] { const char* v = std::getenv("STRATA_POOL_EARLY"); return v != nullptr && std::atoi(v) != 0; }();
++    static thread_local std::vector<int64_t> later;   // entries whose blob was not here yet
++    later.clear();
+     for (int64_t t = 0; t < n_tok; ++t)
+         for (int64_t j = 0; j < k; ++j) {
+             const int64_t i = t * k + j;
+@@ -3309,6 +3679,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 d.fail_expert = e;
+                 return;
+             }
++            if (kind[i] == -3) {            // STRATA_EXPERT_SKIP: left out, its row adds nothing
++                std::memset(row, 0, (size_t) H * sizeof(float));
++                continue;
++            }
+             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+                 if (kind[i] == 0) ++d.cache_hits;
+                 else ++d.offload_entries;                       // #588: PCIe or another GPU
+@@ -3322,8 +3696,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             }
+             ++d.cache_refused;
+             int16_t& jo = d.job_of[(size_t) e];
++            if (jo == -2) {   // STRATA_POOL_EARLY: this expert waits for the second pass, with all its entries
++                later.push_back(i);
++                continue;
++            }
+             if (jo < 0) {
+-                const uint8_t* b = d.src->blob(d.layers, e);
++                const uint8_t* b = early ? d.src->blob_if_ready(d.layers, e) : d.src->blob(d.layers, e);
++                if (b == nullptr && early) {
++                    jo = -2;
++                    later.push_back(i);
++                    continue;
++                }
+                 if (b == nullptr) {
+                     d.failed = true;
+                     d.fail = "the expert source could not produce a blob";
+@@ -3346,9 +3729,42 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         }
+     const auto c3 = std::chrono::steady_clock::now();
+     pt("run", njobs);
+-    if (njobs > 0) {
+-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
++    auto run_jobs = [&](int from, int to) {
++        if (to <= from) return;
++        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + from, to - from);
++        else d.pool->run_split_multi(d.jobs_multi.data() + from, to - from);
++    };
++    if (later.empty()) {
++        run_jobs(0, njobs);
++    } else {   // STRATA_POOL_EARLY: what is here, then the rest as it lands
++        const int ready = njobs;
++        run_jobs(0, ready);
++        for (const int64_t i : later) {
++            const int64_t t = i / k, e = ids[i];
++            int16_t& jo = d.job_of[(size_t) e];
++            if (jo < 0) {   // -2: deferred in the first pass
++                const uint8_t* b = d.src->blob(d.layers, e);
++                if (b == nullptr) {
++                    d.failed = true;
++                    d.fail = "the expert source could not produce a blob";
++                    d.fail_layer = d.layers;
++                    d.fail_expert = e;
++                    ++d.missing;
++                    return;
++                }
++                jo = (int16_t) njobs++;
++                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
++                nj.blob = b;
++                nj.nt = 0;
++            }
++            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
++            jb.act[jb.nt] = &d.act_multi[(size_t) t];
++            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
++            jb.out[jb.nt] = out + (size_t) i * H;
++            ++jb.nt;
++            ++d.multi_entries;
++        }
++        run_jobs(ready, njobs);
+     }
+     if (d.remote_count > 0) {
+         static thread_local std::string remote_error;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 71c0c7d..6ffe67a 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1,5 +1,6 @@
+ // src/core/verify.cpp - see include/strata/core/verify.hpp.
+ #include "strata/core/verify.hpp"
++#include "strata/core/expert_source.hpp"
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/dma_batch.hpp"
+ #include "strata/core/spec_prob.hpp"
+@@ -2005,6 +2006,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+         progress_at("verify window: the CPU experts of layer", l);
+         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr)
+             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+@@ -2688,6 +2690,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+         cur_layer_ = want - 1;
+         set_plan_slot(0);
+         progress_at("verify batch: the CPU experts of layer", l);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+         progress_tick();
+         std::atomic_thread_fence(std::memory_order_seq_cst);
+@@ -2840,6 +2843,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+         const Clock::time_point b = Clock::now();
+         cur_layer_ = want - 1;
+         set_plan_slot(0);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+         progress_tick();
+         std::atomic_thread_fence(std::memory_order_seq_cst);
+@@ -3056,6 +3060,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+         set_plan_slot(grp);
+         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+         progress_at("verify window (pipelined): the CPU experts of layer", l);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr)
+             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 433d395..ae3dc75 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -234,6 +234,114 @@ bool refill_blocking() {
+     return v;
+ }
+ 
++// STRATA_REFILL_BATCH=N (opt-in, low-RAM work): a prompt's lent slots are refilled N experts at a time - the batch read by
++// STRATA_REFILL_THREADS (default 8) threads into one of two pinned staging buffers, its copies queued while the next
++// batch reads.  The per-expert loop read one blob at a time from the mapping, so with the experts on an SSD one read was
++// in flight.  The same bytes land in the same slots.
++int refill_batch() {
++    static const int v = [] { const char* e = std::getenv("STRATA_REFILL_BATCH"); return e ? std::max(0, std::atoi(e)) : 0; }();
++    return v;
++}
++bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
++                    const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, std::string& err) {
++    static const int threads = [] {
++        const char* e = std::getenv("STRATA_REFILL_THREADS");
++        return e ? std::max(1, std::atoi(e)) : 8;
++    }();
++    const size_t B = (size_t) refill_batch();
++    size_t maxb = 0;
++    for (const auto& pr : lent)
++        maxb = std::max(maxb, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
++    maxb = (maxb + 4095) / 4096 * 4096;
++    uint8_t* stage[2] = {nullptr, nullptr};
++    for (auto& st : stage)
++        if (cudaMallocHost((void**) &st, B * maxb) != cudaSuccess) {
++            cudaGetLastError();
++            for (auto& x : stage) if (x != nullptr) cudaFreeHost(x);
++            err = "refill: cannot pin the staging buffers";
++            return false;
++        }
++    bool ok = true;
++    // the reading threads live for the whole refill: an unbuffered read keeps an aligned buffer and an AIO context per
++    // thread, which threads started per batch set up and tore down again every 64 experts
++    std::mutex mu;
++    std::condition_variable go_cv, done_cv;
++    uint64_t go = 0;
++    int done = 0;
++    bool quit = false;
++    size_t cur_at = 0, cur_n = 0, cur_k = 0;
++    std::atomic<size_t> next{0};
++    std::atomic<bool> good{true};
++    auto work = [&] {
++        constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
++        int32_t rl[R], re[R];
++        uint8_t* rd[R];
++        for (size_t j0; (j0 = next.fetch_add(R)) < cur_n;) {
++            const size_t m = std::min(R, cur_n - j0);
++            for (size_t q = 0; q < m; ++q) {
++                const auto& pr = lent[cur_at + j0 + q];
++                rl[q] = (int32_t) (pr.first / n_expert);
++                re[q] = (int32_t) (pr.first % n_expert);
++                rd[q] = stage[cur_k] + (j0 + q) * maxb;
++            }
++            if (!src.copy_blobs(rl, re, rd, m)) good = false;
++        }
++    };
++    std::vector<std::thread> ts;
++    for (int t = 1; t < threads; ++t)
++        ts.emplace_back([&] {
++            for (uint64_t seen = 0;;) {
++                {
++                    std::unique_lock<std::mutex> lk(mu);
++                    go_cv.wait(lk, [&] { return quit || go != seen; });
++                    if (quit) return;
++                    seen = go;
++                }
++                work();
++                {
++                    std::lock_guard<std::mutex> lk(mu);
++                    ++done;
++                }
++                done_cv.notify_one();
++            }
++        });
++    for (size_t at = 0, k = 0; ok && at < lent.size(); at += B, k ^= 1) {
++        const size_t n = std::min(B, lent.size() - at);
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            cur_at = at;
++            cur_n = n;
++            cur_k = k;
++            next.store(0);
++            done = 0;
++            ++go;
++        }
++        go_cv.notify_all();
++        work();
++        {
++            std::unique_lock<std::mutex> lk(mu);
++            done_cv.wait(lk, [&] { return done == (int) ts.size(); });
++        }
++        if (!good) { err = "refill: reading a lent expert failed"; ok = false; break; }
++        // the previous batch's copies (out of the other buffer) land before that buffer is read into again
++        if (!cache.sync_queued(err)) { ok = false; break; }
++        for (size_t j = 0; ok && j < n; ++j) {
++            const auto& pr = lent[at + j];
++            const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert);
++            if (!cache.fill_slot_queued(pr.second, stage[k] + j * maxb, err, nb)) ok = false;
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lk(mu);
++        quit = true;
++    }
++    go_cv.notify_all();
++    for (auto& t : ts) t.join();
++    if (ok && !cache.sync_queued(err)) ok = false;
++    for (auto& st : stage) cudaFreeHost(st);
++    return ok;
++}
++
+ using Clock = std::chrono::steady_clock;
+ 
+ // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
+@@ -4206,6 +4314,31 @@ int main(int argc, char** argv) {
+         } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
+             src.set_io_stats(true);
+         }
++        // STRATA_PROMPT_DIRECT=1: the prompt's expert copies and the refill read straight from the drive, the rest
++        // as above (under a tight RAM cap the cached reads, not the drives, set the prompt's rate)
++        bool prompt_direct = false;
++        if (const char* pv = std::getenv("STRATA_PROMPT_DIRECT"); pv != nullptr && std::atoi(pv) != 0 && !src.unbuffered()) {
++            std::string why;
++            prompt_direct = src.open_prompt_direct(why);
++            std::fprintf(stderr, "strata generate: prompt reads %s (STRATA_PROMPT_DIRECT=1: %s)\n",
++                         prompt_direct ? "unbuffered" : "through the file cache", why.c_str());
++        }
++        // STRATA_DECODE_DIRECT=1: the decode's blob reads straight from the drive(s) as well (they land in stage buffers,
++        // never in the file cache's pages); STRATA_STAGE_KEEP=N keeps the last N of them in RAM instead
++        if (const char* dv = std::getenv("STRATA_DECODE_DIRECT"); dv != nullptr && std::atoi(dv) != 0 && !src.unbuffered()) {
++            std::string why;
++            if (!prompt_direct) prompt_direct = src.open_prompt_direct(why);
++            src.set_decode_direct(prompt_direct);
++            std::fprintf(stderr, "strata generate: decode reads %s (STRATA_DECODE_DIRECT=1%s%s)\n",
++                         src.decode_direct() ? "unbuffered" : "as before", why.empty() ? "" : ": ", why.c_str());
++        }
++        if (const char* kv = std::getenv("STRATA_STAGE_KEEP"); kv != nullptr && std::atoll(kv) > 0) {
++            src.set_stage_keep((size_t) std::atoll(kv));
++            std::fprintf(stderr, "strata generate: the stage pool keeps up to %lld blobs (STRATA_STAGE_KEEP)\n", std::atoll(kv));
++        }
++        if (src.mirrored() && !prompt_direct && !src.unbuffered())
++            std::fprintf(stderr, "strata generate: note: STRATA_EXPERT_MIRROR serves only the direct reads "
++                                 "(STRATA_PROMPT_DIRECT=1, or an unbuffered file tier); none run here\n");
+         srcp = &src;
+     } else {
+         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
+@@ -6799,6 +6932,8 @@ int main(int argc, char** argv) {
+             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
+         }
+         ver.set_remote_expert_opt(remote_opt.get());
++        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
++            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+@@ -9577,6 +9712,11 @@ int main(int argc, char** argv) {
+             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+                 tr("refill start", (long long) p.lent.size());
+                 const strata::core::OnDevice on(p.dev);
++                if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
++                    if (!refill_batched(*srcp, *p.cache, p.lent, g.n_expert, e)) return false;
++                    for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
++                    return true;
++                }
+                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+@@ -11209,7 +11349,14 @@ int main(int argc, char** argv) {
+         // refill the lent slots from the arena and give them back to the decode tier
+         if (!lent.empty()) {
+             const Clock::time_point tr = Clock::now();
+-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
++            if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
++                if (!refill_batched(*srcp, xcache, lent, g.n_expert, err)) {
++                    std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
++                    return 1;
++                }
++                for (const auto& [i, slot] : lent) host_res[(size_t) i] = slot;
++            }
++            else for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
+@@ -11514,6 +11661,8 @@ int main(int argc, char** argv) {
+         vh.blob = thits.blob;
+         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
+         vh.n_slots = xcache.slots();
++        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
++            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+@@ -11940,6 +12089,17 @@ int main(int argc, char** argv) {
+                             (unsigned long long) ic.pf_dropped, (double) ic.pread_bytes / 1e6,
+                             (unsigned long long) ic.pread_n, ic.pread_n > 0 ? (double) ic.pread_us / 1e3 / (double) ic.pread_n : 0.0,
+                             rounds > 0 ? (double) ic.crit_us / 1e3 / rounds : 0.0);
++                if (rounds > 0)
++                    std::printf("%-24s per round: %.1f staged already, %.1f being read ahead (layers waited %.2f ms), %.1f read on "
++                                "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
++                                (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
++                                (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
++                if (rounds > 0 && ic.rd_n > 0)
++                    std::printf("%-24s %.1f blobs per round: drive %.3f ms, bounce copy %.3f ms each (thread time)\n", "direct reads",
++                                (double) ic.rd_n / rounds, (double) ic.rd_io_us / 1e3 / (double) ic.rd_n, (double) ic.rd_copy_us / 1e3 / (double) ic.rd_n);
++                if (rounds > 0 && drive.d.skipped > 0)
++                    std::printf("%-24s %.1f entries per round left out (STRATA_EXPERT_SKIP)\n", "expert skip",
++                                (double) drive.d.skipped / rounds);
+             }
+             if (drive.d.lookahead != nullptr)
+                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "
+diff --git a/tools/rtx5080/build-rtx5080.sh b/tools/rtx5080/build-rtx5080.sh
+new file mode 100755
+index 0000000..8f99243
+--- /dev/null
++++ b/tools/rtx5080/build-rtx5080.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++# tools/rtx5080/build-rtx5080.sh <build dir> <engine name>: the CUDA engine for an RTX 50-series card (sm_120), from the
++# repository root; the result is engine/<engine name>.  CUDA defaults to /usr/local/cuda; CUDAHOSTCXX / CUDAHOSTCC pick
++# the host compiler nvcc runs (default g++ / gcc - set an older one when the system's is newer than the toolkit allows).
++set -e
++cd "$(dirname "$0")/../.."
++B=$1 OUT=$2
++CUDA=${CUDA:-/usr/local/cuda}
++HOSTCXX=$(command -v "${CUDAHOSTCXX:-g++}") HOSTCC=$(command -v "${CUDAHOSTCC:-gcc}")
++export PATH=$CUDA/bin:$PATH
++.venv/bin/cmake -S . -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
++  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
++  -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA" -DCMAKE_CUDA_HOST_COMPILER="$HOSTCXX" \
++  -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX" \
++  -DSTRATA_GGML_DIR="$PWD/third_party/llama.cpp" -DCMAKE_MAKE_PROGRAM="$PWD/.venv/bin/ninja"
++.venv/bin/cmake --build "$B" --target strata
++mkdir -p engine
++cp "$B/strata" "engine/$OUT"
++echo ENGINE_BUILD_OK
+diff --git a/tools/rtx5080/draft_vocab_cut.py b/tools/rtx5080/draft_vocab_cut.py
+new file mode 100644
+index 0000000..67bba7b
+--- /dev/null
++++ b/tools/rtx5080/draft_vocab_cut.py
+@@ -0,0 +1,33 @@
++"""Cut the MTP draft head's token subset to the low token ids (tools/rtx5080/draft_vocab_cut.py).
++
++    python tools/rtx5080/draft_vocab_cut.py <mtp>/draft_vocab.bin out.bin [--below 80000] [--from 247900]
++
++Keeps, in their original order, the ids of the subset below --below (the tokenizer's earlier, more frequent merges)
++plus the special tokens from --from up. Pass the result as --mtp-draft-vocab out.bin.
++
++The draft head only proposes tokens, so the output is unchanged either way; a smaller subset makes each draft
++step cheaper. Text in scripts the cut drops (most CJK, Cyrillic) drafts less.
++"""
++from __future__ import annotations
++
++import argparse
++from array import array
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("src")
++    ap.add_argument("out")
++    ap.add_argument("--below", type=int, default=80000)
++    ap.add_argument("--from", dest="from_id", type=int, default=247900)
++    a = ap.parse_args()
++    ids = array("i")
++    ids.frombytes(open(a.src, "rb").read())
++    keep = array("i", [i for i in ids if i < a.below or i >= a.from_id])
++    open(a.out, "wb").write(keep.tobytes())
++    print(f"{len(keep)} of {len(ids)} tokens kept -> {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/rtx5080/eo5080.py b/tools/rtx5080/eo5080.py
+new file mode 100644
+index 0000000..ab68cce
+--- /dev/null
++++ b/tools/rtx5080/eo5080.py
+@@ -0,0 +1,13 @@
++# tools/rtx5080/eo5080.py <config> <tokens file> [K=V ...] [-- extra engine args]: the config's engine run once on a
++# token file (MAX_NEW tokens, default 1; max context 32768), from the repository root; meant to be wrapped by eo5080.sh
++import json, os, sys
++os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
++cfg = json.load(open(sys.argv[1])); tok = sys.argv[2]; rest = sys.argv[3:]
++extra = rest[rest.index("--") + 1:] if "--" in rest else []
++pairs = rest[:rest.index("--")] if "--" in rest else rest
++env = dict(os.environ); env.update(cfg.get("env", {})); env.update(dict(p.split("=", 1) for p in pairs))
++env["LD_LIBRARY_PATH"] = ":".join(cfg["lib_dirs"])
++args = list(cfg["args"])
++if "--max-context" in args: args[args.index("--max-context") + 1] = "32768"
++cmd = [cfg["exe"]] + args + ["--tokens-file", tok, "--max-new", os.environ.get("MAX_NEW", "1")] + extra
++os.execvpe(cmd[0], cmd, env)
+diff --git a/tools/rtx5080/eo5080.sh b/tools/rtx5080/eo5080.sh
+new file mode 100755
+index 0000000..3f81232
+--- /dev/null
++++ b/tools/rtx5080/eo5080.sh
+@@ -0,0 +1,12 @@
++#!/bin/bash
++# tools/rtx5080/eo5080.sh <cap|none> <config> <tokens file> [K=V ...] [-- engine args]: the config's engine once on a
++# token file (eo5080.py) under a RAM cap, the file cache dropped first where `sudo -n` may; the engine's output goes to
++# /tmp/eo5080.log, ending with the run's peak memory (file cache included)
++cd "$(dirname "$0")/../.."
++CAP=$1; shift
++sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || echo "note: the file cache was not dropped (sudo -n)"
++CAPARGS=(); [ "$CAP" != none ] && CAPARGS=(-p MemoryMax=$CAP -p MemorySwapMax=0)
++systemd-run --user --scope -q -p MemoryAccounting=yes "${CAPARGS[@]}" bash -c \
++  '.venv/bin/python tools/rtx5080/eo5080.py "$@"; echo "memory peak $(( $(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.peak) / 1048576 )) MiB"' \
++  _ "$@" > /tmp/eo5080.log 2>&1
++grep -E "^prefill |^decode |^memory peak" /tmp/eo5080.log | cut -c1-200
+diff --git a/tools/rtx5080/expert_mirror.py b/tools/rtx5080/expert_mirror.py
+new file mode 100755
+index 0000000..8be4518
+--- /dev/null
++++ b/tools/rtx5080/expert_mirror.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""Make a copy of a GGUF shard's experts on a second drive, for STRATA_EXPERT_MIRROR.
++
++    expert_mirror.py <shard.gguf> <copy> [--share 0.63]
++
++The engine's direct reads (STRATA_PROMPT_DIRECT=1, or an unbuffered file tier) take experts n - round(n * share) and
++up of every layer from the copy, so the copy only needs those.  This writes a file the size of the shard with just
++those byte ranges filled in (the rest is left as holes, which take no space): about `share` of the expert bytes.
++Build it with the same --share the engine runs with, or a larger one; the engine checks the copy at start and refuses
++one that lacks the experts it would read from it.  --share 1 copies every expert.
++"""
++import argparse
++import math
++import os
++import re
++import struct
++import sys
++import time
++
++EXPERT = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight$")
++SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
++
++
++def read_tensors(path):
++    """(data offset, alignment, [(name, dims, offset in data)]) of a GGUF file (v2/v3)."""
++    with open(path, "rb") as f:
++        def take(fmt):
++            n = struct.calcsize("<" + fmt)
++            return struct.unpack("<" + fmt, f.read(n))
++
++        def string():
++            (n,) = take("Q")
++            return f.read(n).decode("utf-8", "replace")
++
++        def skip(t):
++            if t in SCALAR:
++                f.seek(struct.calcsize("<" + SCALAR[t]), 1)
++            elif t == 8:
++                (n,) = take("Q")
++                f.seek(n, 1)
++            elif t == 9:
++                et, n = take("IQ")
++                if et in SCALAR:
++                    f.seek(n * struct.calcsize("<" + SCALAR[et]), 1)
++                else:
++                    for _ in range(n):
++                        skip(et)
++            else:
++                sys.exit(f"{path}: unknown GGUF value type {t}")
++
++        if f.read(4) != b"GGUF":
++            sys.exit(f"{path}: not a GGUF file")
++        version, n_tensors, n_kv = take("IQQ")
++        if version < 2:
++            sys.exit(f"{path}: GGUF version {version} is too old")
++        align = 32
++        for _ in range(n_kv):
++            key = string()
++            (t,) = take("I")
++            if key == "general.alignment" and t == 4:
++                (align,) = take("I")
++            else:
++                skip(t)
++        tensors = []
++        for _ in range(n_tensors):
++            name = string()
++            (nd,) = take("I")
++            dims = take("Q" * nd)
++            _, off = take("IQ")
++            tensors.append((name, dims, off))
++        data = (f.tell() + align - 1) // align * align
++    return data, align, tensors
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    ap.add_argument("shard")
++    ap.add_argument("copy")
++    ap.add_argument("--share", type=float, default=0.5, help="the STRATA_EXPERT_MIRROR_SHARE it is for (default 0.5)")
++    a = ap.parse_args()
++    share = min(max(a.share, 0.0), 1.0)
++    size = os.path.getsize(a.shard)
++    data, align, tensors = read_tensors(a.shard)
++    ends = sorted(off for _, _, off in tensors) + [size - data]
++    ranges = []
++    for name, dims, off in tensors:
++        if not EXPERT.match(name):
++            continue
++        n = dims[-1]
++        span = min(e for e in ends if e > off) - off
++        per = span // n
++        if span - per * n >= align:
++            sys.exit(f"{name}: {span} bytes do not split into {n} experts")
++        cut = n - math.floor(n * share + 0.5)
++        if cut < n:
++            ranges.append((data + off + cut * per, (n - cut) * per))
++    if not ranges:
++        sys.exit(f"{a.shard}: no expert tensors (blk.N.ffn_*_exps.weight)")
++    total = sum(b for _, b in ranges)
++    print(f"{len(ranges)} expert ranges, {total / 1e9:.2f} GB of {size / 1e9:.2f} GB", flush=True)
++    t0 = time.time()
++    buf = bytearray(64 << 20)
++    with open(a.shard, "rb", buffering=0) as src, open(a.copy, "r+b" if os.path.exists(a.copy) else "w+b", buffering=0) as dst:
++        os.ftruncate(dst.fileno(), size)
++        done = 0
++        for at, n in sorted(ranges):
++            src.seek(at)
++            dst.seek(at)
++            while n > 0:
++                k = src.readinto(memoryview(buf)[: min(n, len(buf))])
++                if not k:
++                    sys.exit(f"{a.shard}: short read at {at}")
++                dst.write(memoryview(buf)[:k])
++                n -= k
++                done += k
++            print(f"\r{done / 1e9:7.2f} / {total / 1e9:.2f} GB  {done / 1e9 / max(time.time() - t0, 1e-3):.2f} GB/s", end="", flush=True)
++        os.fsync(dst.fileno())
++    print(f"\ndone: STRATA_EXPERT_MIRROR={os.path.abspath(a.copy)} STRATA_EXPERT_MIRROR_SHARE={share:g} (or less)")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/rtx5080/expert_pack.py b/tools/rtx5080/expert_pack.py
+new file mode 100644
+index 0000000..bf870d2
+--- /dev/null
++++ b/tools/rtx5080/expert_pack.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""Write a GGUF shard's experts to a second drive as whole blobs, for STRATA_EXPERT_MIRROR.
++
++    expert_pack.py <shard.gguf> <out> [--share 0.75]
++
++The engine assembles each expert as one blob - its gate, up and down slices, in that order - out of three scattered
++slices of the shard. This file stores experts n - round(n * share) .. n-1 of every layer as such blobs, each starting
++on a 4 KiB boundary, so the engine reads a blob from it in one request. QLC drives serve one 2 MB request faster than
++three scattered 0.7 MB ones. Give the file to the engine as STRATA_EXPERT_MIRROR (it tells this layout from a plain
++copy by its header) with STRATA_EXPERT_MIRROR_SHARE / _DECODE_SHARE at or below the share it was written with.
++
++Layout: a 4 KiB-aligned header - "STRPACK1", u32 version (1), n_layers, n_expert, first expert, u64 shard size, then
++per layer u64 blob bytes, stride (blob bytes rounded up to 4 KiB) and the file offset of the layer's first blob.
++"""
++import argparse
++import math
++import os
++import re
++import struct
++import sys
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from expert_mirror import read_tensors  # noqa: E402
++
++ROLE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
++A = 4096
++
++
++def up4k(x):
++    return (x + A - 1) // A * A
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    ap.add_argument("shard")
++    ap.add_argument("out")
++    ap.add_argument("--share", type=float, default=0.75)
++    a = ap.parse_args()
++    size = os.path.getsize(a.shard)
++    data, align, tensors = read_tensors(a.shard)
++    ends = sorted(off for _, _, off in tensors) + [size - data]
++    layers, n_expert = {}, None
++    for name, dims, off in tensors:
++        m = ROLE.match(name)
++        if not m:
++            continue
++        n = dims[-1]
++        n_expert = n if n_expert is None else n_expert
++        if n != n_expert:
++            sys.exit(f"{name}: {n} experts, others have {n_expert}")
++        span = min(e for e in ends if e > off) - off
++        per = span // n
++        if span - per * n >= align:
++            sys.exit(f"{name}: {span} bytes do not split into {n} experts")
++        layers.setdefault(int(m.group(1)), {})[m.group(2)] = (data + off, per)
++    if not layers or any(len(r) != 3 for r in layers.values()):
++        sys.exit(f"{a.shard}: every layer needs ffn_gate_exps, ffn_up_exps and ffn_down_exps in this shard")
++    n_layers = max(layers) + 1
++    if sorted(layers) != list(range(n_layers)):
++        sys.exit(f"{a.shard}: layers {sorted(set(range(n_layers)) - set(layers))} have no experts here")
++    first = n_expert - math.floor(n_expert * min(max(a.share, 0.0), 1.0) + 0.5)
++    count = n_expert - first
++    head = 8 + 4 * 4 + 8 + n_layers * 24
++    at = up4k(head)
++    table = []
++    for L in range(n_layers):
++        blob = sum(layers[L][r][1] for r in ("gate", "up", "down"))
++        table.append((blob, up4k(blob), at))
++        at += up4k(blob) * count
++    total = at
++    print(f"{n_layers} layers, experts {first}..{n_expert - 1}: {total / 1e9:.2f} GB", flush=True)
++    hdr = b"STRPACK1" + struct.pack("<IIII", 1, n_layers, n_expert, first) + struct.pack("<Q", size)
++    for blob, stride, off in table:
++        hdr += struct.pack("<QQQ", blob, stride, off)
++    t0 = time.time()
++    with open(a.shard, "rb", buffering=0) as src, open(a.out, "wb", buffering=0) as dst:
++        dst.write(hdr + bytes(up4k(len(hdr)) - len(hdr)))
++        for L in range(n_layers):
++            blob, stride, off = table[L]
++            parts = []
++            for r in ("gate", "up", "down"):
++                o, per = layers[L][r]
++                src.seek(o + first * per)
++                buf = src.read(per * count)
++                if len(buf) != per * count:
++                    sys.exit(f"{a.shard}: short read in layer {L}")
++                parts.append((buf, per))
++            out = bytearray(stride * count)
++            for i in range(count):
++                p = i * stride
++                for buf, per in parts:
++                    out[p:p + per] = buf[i * per:(i + 1) * per]
++                    p += per
++            if dst.tell() != off:
++                sys.exit(f"layer {L}: at {dst.tell()}, expected {off}")
++            dst.write(out)
++            print(f"\rlayer {L + 1}/{n_layers}  {dst.tell() / 1e9:.2f} GB  {dst.tell() / 1e9 / max(time.time() - t0, 1e-3):.2f} GB/s",
++                  end="", flush=True)
++        os.fsync(dst.fileno())
++    print(f"\ndone: STRATA_EXPERT_MIRROR={os.path.abspath(a.out)} (shares up to {count / n_expert:g})")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/rtx5080/lbench.py b/tools/rtx5080/lbench.py
+new file mode 100644
+index 0000000..a14f5a1
+--- /dev/null
++++ b/tools/rtx5080/lbench.py
+@@ -0,0 +1,47 @@
++# tools/rtx5080/lbench.py <out.json> <target tokens,...> [rounds]: against the running server - for each target, a
++# fresh prompt of about that many tokens (a unique first line, then text from LBENCH_CORPUS, a large text file)
++# ending in a writing request; records the prompt rate, the writing rate of a 256-token answer, and the engine's own
++# line for the request from its log (LBENCH_LOG, the config's "log")
++import json, os, random, sys, time, urllib.request, re
++os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
++out, targets = sys.argv[1], [int(x) for x in sys.argv[2].split(",")]
++rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 1
++corpus = open(os.environ["LBENCH_CORPUS"], errors="replace").read()
++log = os.environ.get("LBENCH_LOG", "strata-5080-iq3s.log")
++TASK = "\n\n---\nIgnore the text above. Write a long story about a lighthouse keeper who finds a message in a bottle."
++def ask(text, n):
++    body = {"model": "x", "messages": [{"role": "user", "content": text}], "max_tokens": n, "reasoning_effort": "none",
++            "temperature": 0}
++    r = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions", json.dumps(body).encode(),
++                               {"Content-Type": "application/json"})
++    return json.load(urllib.request.urlopen(r, timeout=3600))
++def last_engine_line():
++    if not os.path.exists(log): return ""
++    lines = [l for l in open(log, errors="replace") if l.startswith("strata serve: prompt ")]
++    return lines[-1].strip() if lines else ""
++ratio = 3.3   # characters per token, corrected after every request
++results = json.load(open(out)) if os.path.exists(out) else []
++ask("Say hello.", 8)
++for rd in range(rounds):
++    for tgt in targets:
++        for attempt in range(3):
++            head = "Note %d.\n\n" % random.randint(0, 10**12)
++            nchar = int((tgt - 60) * ratio)
++            if nchar > len(corpus): sys.exit("LBENCH_CORPUS has %d characters; %d tokens need about %d" % (len(corpus), tgt, nchar))
++            start = random.randint(0, max(0, len(corpus) - nchar - 1)) if rd > 0 else 0
++            text = head + corpus[start:start + nchar] + TASK
++            t0 = time.time()
++            d = ask(text, 256)
++            tm = d["timings"]
++            ratio = nchar / max(1, tm["prompt_n"] - 60)
++            if abs(tm["prompt_n"] - tgt) <= max(256, tgt * 0.03) or attempt == 2: break
++            print("  resize: asked %d, got %d tokens (ratio now %.3f)" % (tgt, tm["prompt_n"], ratio), flush=True)
++        line = last_engine_line()
++        m = re.search(r"drafts accepted (\d+) of (\d+)", line)
++        r = {"target": tgt, "round": rd, "prompt_n": tm["prompt_n"], "prompt_tps": tm["prompt_per_second"],
++             "prompt_s": tm["prompt_ms"] / 1000, "gen_n": tm["predicted_n"], "gen_tps": tm["predicted_per_second"],
++             "drafts": [int(m.group(1)), int(m.group(2))] if m else None, "wall_s": time.time() - t0, "engine": line}
++        results.append(r)
++        json.dump(results, open(out, "w"), indent=1)
++        print("%6dK r%d  prompt %7d tok in %6.1f s = %5.1f tok/s | writing %3d tok at %5.2f tok/s | drafts %s" % (
++            tgt // 1024, rd, r["prompt_n"], r["prompt_s"], r["prompt_tps"], r["gen_n"], r["gen_tps"], r["drafts"]), flush=True)
+diff --git a/tools/rtx5080/lp5080.py b/tools/rtx5080/lp5080.py
+new file mode 100644
+index 0000000..f271b8a
+--- /dev/null
++++ b/tools/rtx5080/lp5080.py
+@@ -0,0 +1,41 @@
++# tools/rtx5080/lp5080.py <label> [K=V ...]: the low-RAM server (srv5080.sh, LP_CAP, default 8G) reads a conversation
++# through its writing path (--short-read, adaptive tier off) and writes every position's log-probabilities to
++# /tmp/lp_<label>.tsv; compare two such files with lp_cmp.py.  LP_CFG: the config (default
++# tools/rtx5080/strata-5080-lowram-iq3s.json); LP_MSGS=<json>: the conversation (default /tmp/lp_ref_story.json);
++# LP_GEN=1: write the reference conversations instead (/tmp/lp_ref_story.json, /tmp/lp_ref_code.json: the model's own
++# 300-token answers to a story and a code request, with these settings)
++import json, os, subprocess, sys, urllib.request
++os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
++SRV = "tools/rtx5080/srv5080.sh"
++label, pairs = sys.argv[1], sys.argv[2:]
++cfg = json.load(open(os.environ.get("LP_CFG", "tools/rtx5080/strata-5080-lowram-iq3s.json")))
++cfg.setdefault("env", {}).update(dict(p.split("=", 1) for p in pairs))
++out = "/tmp/lp_%s.tsv" % label
++if os.path.exists(out): os.remove(out)
++if not os.environ.get("LP_GEN"):
++    cfg["env"]["STRATA_LOGPOS"] = out
++    cfg["env"]["STRATA_LOGPOS_TOPK"] = "20"
++    cfg["args"] += ["--short-read", "8192"]
++cfg["args"] += ["--adapt-every", "100000"]
++run = "/tmp/strata-5080-lp.json"
++json.dump(cfg, open(run, "w"), indent=1)
++up = subprocess.run([SRV, "start", run, os.environ.get("LP_CAP", "8G")], capture_output=True, text=True).stdout.strip()
++if not up.startswith("up"): print(label, "FAILED TO START", up[-400:]); sys.exit(1)
++def ask(msgs, n):
++    body = {"model": "x", "messages": msgs, "max_tokens": n, "reasoning_effort": "none", "temperature": 0}
++    r = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
++    return json.load(urllib.request.urlopen(r, timeout=1800))
++P = {"story": "Write a long story about a lighthouse keeper who finds a message in a bottle.",
++     "code": "Write a Python function that parses a CSV file and returns the rows as dictionaries, with error handling."}
++try:
++    if os.environ.get("LP_GEN"):
++        for k, q in P.items():
++            a = ask([{"role": "user", "content": q}], 300)["choices"][0]["message"]["content"]
++            json.dump([{"role": "user", "content": q}, {"role": "assistant", "content": a}], open("/tmp/lp_ref_%s.json" % k, "w"))
++            print(label, k, "reference:", len(a), "chars")
++    else:
++        msgs = json.load(open(os.environ.get("LP_MSGS", "/tmp/lp_ref_story.json")))
++        d = ask(msgs, 1)
++        print(label, d["timings"]["prompt_n"], "tokens read")
++finally:
++    subprocess.run([SRV, "stop"], capture_output=True)
+diff --git a/tools/rtx5080/lp_cmp.py b/tools/rtx5080/lp_cmp.py
+new file mode 100644
+index 0000000..9692f51
+--- /dev/null
++++ b/tools/rtx5080/lp_cmp.py
+@@ -0,0 +1,32 @@
++# tools/rtx5080/lp_cmp.py <a.tsv> <b.tsv>: per-position comparison of two teacher-forced runs on the same tokens
++import sys, math
++def load(p):
++    rows = {}
++    for line in open(p):
++        f = line.rstrip("\n").split("\t")
++        pos, tgt, lp, top, toplp = int(f[0]), int(f[1]), float(f[2]), int(f[3]), float(f[4])
++        tk = {}
++        for c in f[8:]:
++            for kv in c.split():
++                if ":" in kv:
++                    i, v = kv.split(":"); tk[int(i)] = float(v)
++        rows[pos] = (tgt, lp, top, tk)
++    return rows
++A, B = load(sys.argv[1]), load(sys.argv[2])
++common = sorted(set(A) & set(B))
++n = len(common); agree = 0; kl = 0.0; nlla = nllb = 0.0; t5 = 0
++for p in common:
++    ta, la, pa, ka = A[p]; tb, lb, pb, kb = B[p]
++    assert ta == tb
++    agree += pa == pb; nlla -= la; nllb -= lb
++    # KL(A||B) over A's top 20 + rest bucket
++    restA = 1 - sum(math.exp(v) for v in ka.values()); restB = 1 - sum(math.exp(kb[i]) for i in ka if i in kb)
++    s = 0.0
++    for i, v in ka.items():
++        q = kb.get(i, math.log(max(1e-9, restB / 1000)))
++        s += math.exp(v) * (v - q)
++    if restA > 1e-9 and restB > 1e-9: s += restA * math.log(restA / restB)
++    kl += s
++    top5a = set(sorted(ka, key=lambda i: -ka[i])[:5]); top5b = set(sorted(kb, key=lambda i: -kb[i])[:5]); t5 += len(top5a & top5b)
++print("positions %d | top-1 agreement %.1f%% | top-5 overlap %.1f%% | KL %.4f | perplexity %.3f vs %.3f" %
++      (n, 100 * agree / n, 100 * t5 / (5 * n), kl / n, math.exp(nlla / n), math.exp(nllb / n)))
+diff --git a/tools/rtx5080/mkcfg.py b/tools/rtx5080/mkcfg.py
+new file mode 100644
+index 0000000..86eccd4
+--- /dev/null
++++ b/tools/rtx5080/mkcfg.py
+@@ -0,0 +1,12 @@
++# tools/rtx5080/mkcfg.py <base.json> <out.json> [--flag value ...]: a copy of a server config with those engine flags set (replaced
++# when present, added otherwise); "--flag -" removes the flag and its value
++import json, sys
++c = json.load(open(sys.argv[1])); a = c["args"]; kv = sys.argv[3:]
++for i in range(0, len(kv), 2):
++    f, v = kv[i], kv[i + 1]
++    if f in a:
++        j = a.index(f)
++        if v == "-": del a[j:j + 2]
++        else: a[j + 1] = v
++    elif v != "-": a += [f, v]
++json.dump(c, open(sys.argv[2], "w"), indent=1)
+diff --git a/tools/rtx5080/run-5080-lowram.sh b/tools/rtx5080/run-5080-lowram.sh
+new file mode 100755
+index 0000000..03be250
+--- /dev/null
++++ b/tools/rtx5080/run-5080-lowram.sh
+@@ -0,0 +1,13 @@
++#!/bin/sh
++# Strata on an RTX 5080 Laptop with little RAM (Qwen3.8-Flash-Next abliterated IQ3_S): the OpenAI-compatible server on
++# 127.0.0.1:8080.  The experts the GPU does not hold are read from two SSDs as needed: the model's own, and a packed
++# copy of most of each layer's experts on a second drive (tools/rtx5080/expert_pack.py, STRATA_EXPERT_MIRROR in the
++# config).  RAM - the engine, its expert cache and the file cache - is capped at ${STRATA_RAM:-8G}, swap off; with more
++# RAM raise the config's STRATA_STAGE_KEEP too (about 490 experts per extra GB).  STRATA_EXPERT_SKIP=0.1 writes faster
++# by leaving out light experts that are not at hand (slightly different answers; off unless set).  --kv-grow lends
++# the graphics memory the K/V does not use yet to the expert cache, and two conversation checkpoints (--prompt-cache 2)
++# keep a long prompt inside the RAM cap.  The int8 K/V fits 163,840 tokens beside the prompt path's loan on a 16 GB
++# card (--max-context).  STRATA_CONFIG picks another config.
++cd "$(dirname "$0")/../.."
++exec systemd-run --user --scope -p MemoryMax=${STRATA_RAM:-8G} -p MemorySwapMax=0 \
++  .venv/bin/python serve/server.py --engine strata --config "${STRATA_CONFIG:-tools/rtx5080/strata-5080-lowram-iq3s.json}" --port 8080 "$@"
+diff --git a/tools/rtx5080/srv5080.sh b/tools/rtx5080/srv5080.sh
+new file mode 100755
+index 0000000..2bae767
+--- /dev/null
++++ b/tools/rtx5080/srv5080.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++# tools/rtx5080/srv5080.sh start <config> [MemoryMax e.g. 8G | none] | stop | mem
++# the Strata server as a transient user service (its own cgroup: RAM incl. page cache is accounted; an optional hard
++# cap with swap off), on 127.0.0.1:8080; start waits until it answers
++ROOT=$(cd "$(dirname "$0")/../.." && pwd)
++U=strata5080
++cg() { echo /sys/fs/cgroup$(systemctl --user show $U.service -p ControlGroup --value); }
++case "$1" in
++start)
++  systemctl --user stop $U.service 2>/dev/null; systemctl --user reset-failed $U.service 2>/dev/null
++  for i in $(seq 60); do (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null || break; sleep 1; done
++  CAP=(); [ -n "$3" ] && [ "$3" != none ] && CAP=(-p MemoryMax=$3 -p MemorySwapMax=0)
++  systemd-run --user --unit=$U --collect -p MemoryAccounting=yes "${CAP[@]}" --working-directory="$ROOT" \
++    "$ROOT/.venv/bin/python" serve/server.py --engine strata --config "$2" --port 8080 >/dev/null 2>&1
++  for i in $(seq 200); do
++    curl -s -m 2 http://127.0.0.1:8080/v1/models >/dev/null && { echo "up ($(( $(cat $(cg)/memory.current) / 1048576 )) MiB now)"; exit 0; }
++    systemctl --user is-active -q $U.service || { echo "service stopped"; journalctl --user -u $U -n 15 --no-pager | cut -c1-200; exit 1; }
++    sleep 2
++  done; echo "not up";;
++stop) systemctl --user stop $U.service;;
++mem) C=$(cg); echo "current $(( $(cat $C/memory.current) / 1048576 )) MiB, peak $(( $(cat $C/memory.peak) / 1048576 )) MiB"
++     grep -E "^(anon|file|shmem|unevictable) " $C/memory.stat | awk '{printf "%s %d MiB  ", $1, $2/1048576} END {print ""}';;
++esac
+diff --git a/tools/rtx5080/strata-5080-lowram-iq3s.json b/tools/rtx5080/strata-5080-lowram-iq3s.json
+new file mode 100644
+index 0000000..1107a6a
+--- /dev/null
++++ b/tools/rtx5080/strata-5080-lowram-iq3s.json
+@@ -0,0 +1,65 @@
++{
++ "exe": "engine/strata-5080",
++ "args": [
++  "--pack",
++  "packs/sc117-iq3_s",
++  "--native",
++  "models/sc117-iq3_s/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
++  "--ple-gguf",
++  "models/sc117-iq3_s/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf",
++  "--expert-profile",
++  "data/expert-profile.bin",
++  "--expert-cache",
++  "auto",
++  "--prefill",
++  "auto:16384",
++  "--spec",
++  "4",
++  "--spec-min-p",
++  "0.5",
++  "--mtp",
++  "mtp/rt",
++  "--max-context",
++  "163840",
++  "--kv",
++  "int8",
++  "--mmap-experts",
++  "--mtp-draft-vocab",
++  "mtp/draft_vocab_80k.bin",
++  "--adapt-every",
++  "1",
++  "--adapt-swaps",
++  "256",
++  "--prompt-cache",
++  "2",
++  "--prompt-cache-every",
++  "0",
++  "--kv-grow"
++ ],
++ "cwd": ".",
++ "tokenizer": "packs/sc117-iq3_s/tokenizer",
++ "model_name": "qwen3.8-flash-next-abliterated-iq3_s",
++ "log": "strata-5080-iq3s.log",
++ "lib_dirs": [
++  "/usr/local/cuda/lib64"
++ ],
++ "port": 8080,
++ "backend": "cuda",
++ "env": {
++  "STRATA_PROMPT_DIRECT": "1",
++  "STRATA_DECODE_DIRECT": "1",
++  "STRATA_EXPERT_MIRROR": "/path/to/second-drive/iq3s-experts.pack",
++  "STRATA_EXPERT_MIRROR_SHARE": "0.85",
++  "STRATA_EXPERT_MIRROR_DECODE_SHARE": "0.75",
++  "STRATA_STAGE_KEEP": "2600",
++  "STRATA_POOL_EARLY": "1",
++  "STRATA_STAGER_THREADS": "16",
++  "STRATA_STAGER_BATCH": "4",
++  "STRATA_REFILL_BATCH": "32",
++  "STRATA_IO_PREFETCH": "1",
++  "STRATA_LOOKAHEAD_K": "5",
++  "STRATA_IO_PREFETCH_DEPTH": "1",
++  "CUDA_MODULE_LOADING": "LAZY"
++ },
++ "expert_profile_save": "expert-profile-learned-5080-iq3s.bin"
++}
+\ No newline at end of file
+diff --git a/tools/rtx5080/w5080.py b/tools/rtx5080/w5080.py
+new file mode 100644
+index 0000000..eabc0ac
+--- /dev/null
++++ b/tools/rtx5080/w5080.py
+@@ -0,0 +1,35 @@
++# tools/rtx5080/w5080.py <label> <config.json> <MemoryMax|none> [K=V ...]: the server (srv5080.sh) in its own cgroup,
++# a 6K-token summary prompt, a 300-token story and a 300-token code answer; prompt rate, both writing rates, the
++# server's RAM at the end (cgroup: anon + page cache) and an md5 of each answer.  REPEAT=N writes story + code N times.
++import hashlib, json, os, random, subprocess, sys, urllib.request
++os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
++SRV = "tools/rtx5080/srv5080.sh"
++label, conf, cap, pairs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
++cfg = json.load(open(conf))
++cfg.setdefault("env", {}).update(dict(p.split("=", 1) for p in pairs))
++run = "/tmp/strata-5080-run.json"
++json.dump(cfg, open(run, "w"), indent=1)
++up = subprocess.run([SRV, "start", run, cap], capture_output=True, text=True).stdout.strip()
++if not up.startswith("up"):
++    print(label, "FAILED TO START:", up[-600:]); sys.exit(1)
++def ask(msg, n):
++    body = {"model": "x", "messages": [{"role": "user", "content": msg}], "max_tokens": n, "reasoning_effort": "none", "temperature": 0}
++    r = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
++    return json.load(urllib.request.urlopen(r, timeout=1800))
++try:
++    ask("Say hello.", 8)
++    text = open("docs/DETAILS.md").read()[:18000]
++    p = ask("Note %d. Summarise this in three sentences:\n\n" % random.randint(0, 10**9) + text, 60)["timings"]
++    for rep in range(int(os.environ.get("REPEAT", "1"))):
++        s = ask("Write a long story about a lighthouse keeper who finds a message in a bottle.", 300)
++        c = ask("Write a Python class for an LRU cache with get and put, then explain how it works.", 300)
++        if os.environ.get("REPEAT"):
++            print("   pass %d: story %5.1f code %5.1f w/s" % (rep + 1, s["timings"]["predicted_per_second"], c["timings"]["predicted_per_second"]), flush=True)
++    mem = subprocess.run([SRV, "mem"], capture_output=True, text=True).stdout.strip().replace("\n", " | ")
++    print("%-12s prompt %5d tok %5.0f tok/s | story %5.1f | code %5.1f w/s | %s | out %s %s" % (
++        label, p["prompt_n"], p["prompt_per_second"], s["timings"]["predicted_per_second"], c["timings"]["predicted_per_second"],
++        mem, hashlib.md5(s["choices"][0]["message"]["content"].encode()).hexdigest()[:8], hashlib.md5(c["choices"][0]["message"]["content"].encode()).hexdigest()[:8]), flush=True)
++except Exception as e:
++    print(label, "FAILED:", e)
++    if cfg.get("log") and os.path.exists(cfg["log"]): print(open(cfg["log"], errors="replace").read()[-800:])
++subprocess.run([SRV, "stop"])
