@@ -9,7 +9,8 @@ faster on two kinds of laptop graphics:
   are read straight from one or two SSDs as they are needed, with an optional RAM cache. With IQ3_S on an
   RTX 5080 Laptop it writes about 3x faster at an 8 GB RAM cap than without it.
 
-Both apply to a clean Strata checkout, alone or together. The 890M results for IQ3_S below use both.
+Both apply to a clean Strata checkout, alone or together. The 890M results for IQ3_S and for little memory below
+use both.
 
 ## Apply
 
@@ -194,6 +195,81 @@ Without the patch (stock Fedora ROCm 7.1 build), a 6K-token prompt read at 130 t
 These used `configs/strata-890m-iq3s.json` with `--max-context 262144` and the second-drive copy. With the 890M patch
 alone and the automatic cache size (30 GB), the same server read 8K at 234 tokens/s and 32K at 125, and wrote at
 9.5-11.
+
+### Radeon 890M with little memory, both patches
+
+The 890M has no memory of its own, so its expert cache comes out of the laptop's RAM. With both patches,
+`--expert-cache` can be set far below the whole model: the experts that do not fit are read from the SSDs as they are
+needed, as on the RTX 5080. These runs find how small the cache can go and still be usable, for example on battery.
+
+**Setup:**
+- `configs/strata-890m-q2_0-lowram.json` for Q2_0, and `configs/strata-890m-iq3s.json` for IQ3_S, each with the
+  `--expert-cache` shown in the tables.
+- 32K context, 8-bit K/V, and the second-drive copy (`--share 0.9`).
+- The server started with the engine's own RAM capped at 4 GB. Copy the config into the Strata folder, then:
+  `STRATA_CONFIG=strata-890m-q2_0-lowram.json STRATA_RAM=4G tools/rtx5080/run-5080-lowram.sh`
+
+On a native pack, `--expert-cache N` is a byte budget of N times the largest expert. IQ3_S's experts vary in size, so
+it fits about 30% more experts than N.
+
+**Memory** is the whole laptop's: the drop in available memory at the server's peak. The 890M's share of RAM does not
+count towards the 4 GB cap, so the cap alone would understate it.
+
+**Tests:**
+- a 6K-token prompt;
+- a 256-token story after a 2K-token prompt;
+- a 1,024-token code answer (a Python module with its tests, temperature 0) through the server.
+
+One run per row, on the laptop's 240 W charger.
+
+Q2_0, tokens/s:
+
+| Total memory | `--expert-cache` | 6K prompt | Story | Code answer |
+| ---: | ---: | ---: | ---: | ---: |
+| ~9 GB | 1,100 | 367 | 9.6 | 11.1 |
+| ~13 GB | 4,200 | 490 | 12.1 | 15.1 |
+| ~21 GB | 10,400 | 536 | 13.9 | 20.1 |
+| ~29 GB* | 16,500 | 571 | 17.5 | – |
+| ~40 GB | 24,576 (all) | ~580 | 24.9 | 31.8 |
+
+\* Estimated from the cache size, not measured.
+
+IQ3_S, tokens/s:
+
+| Total memory | `--expert-cache` (experts held) | 6K prompt | Story | Code answer |
+| ---: | ---: | ---: | ---: | ---: |
+| ~10 GB | 560 (718) | 222 | 7.7 | 8.8 |
+| ~14 GB | 2,130 (2,753) | 420 | 9.0 | – |
+| ~18 GB | 3,700 (4,817) | 436 | 10.1 | 12.6 |
+| ~22 GB | 5,280 (6,899) | 453 | 11.1 | – |
+| ~30 GB | 8,350 (10,908) | 481 | 14.4 | 17.4 |
+| ~47 GB | 15,000 (19,523) | 519 | 16.7 | 20.0 |
+
+What they show:
+- **Q2_0 at about 13 GB** is the smallest setup that still feels usable: 15 tokens/s on code, and a 6K prompt read in
+  about 12 seconds. Below it, writing drops to 10-11 tokens/s and prompts slow by a quarter.
+- **IQ3_S needs roughly 10 GB more** than Q2_0 for the same writing speed. Its experts are about 1.5 times bigger, so
+  every token reads more from the drives. Its prompts suffer most at the bottom: 222 tokens/s at 10 GB.
+- **Above about 20 GB, prompts gain little:** 8-15% more all the way to the full model. Writing keeps improving, and
+  jumps once every expert fits (Q2_0: 17.5 → 24.9 tokens/s from about 29 to 40 GB).
+
+**Power.** The same code answer on a 70 W USB-C charger, with the processor package's power (CPU and 890M together)
+averaged while it wrote:
+
+| Model, total memory | Code answer, tokens/s | Package power | Energy per token |
+| --- | ---: | ---: | ---: |
+| Q2_0, ~9 GB | 10.5 | 45.9 W | 4.4 J |
+| IQ3_S, ~19 GB | 11.7 | 35.2 W | 3.0 J |
+| IQ3_S, ~30 GB | 15.9 | 40.0 W | 2.5 J |
+| IQ3_S, ~48 GB | 18.2 | 42.3 W | 2.3 J |
+
+- **The smallest cache costs the most energy per token.** It reads the drives the most and runs the longest. A
+  bigger cache costs memory but saves battery.
+- **`STRATA_POOL_SPIN_US=0`** (a stock Strata setting) stops the CPU workers from spinning while they wait for work.
+  On IQ3_S at about 19 GB it cut package power from 35.2 W to 28.8 W, for 11.3 → 11.0 tokens/s. The low-memory config
+  sets it.
+- **Let a discrete GPU switch off.** On this laptop the RTX 5080, kept awake but idle, drew about 18 W, which counts
+  against the battery whatever the 890M is doing.
 
 ## License
 
