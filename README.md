@@ -276,50 +276,31 @@ charged. The RTX 5080 figures below do.
 
 ### Low power: RTX 5080 Laptop on a USB-C charger
 
-Settings that keep the battery charging while the server works, on a 70 W and a 100 W USB-C charger. All IQ3_S with
-the low-RAM patch, 8-bit K/V, screen off.
+The fastest settings found that keep the battery charging while the server works. IQ3_S with the low-RAM patch,
+32 GB of RAM, 8-bit K/V, screen off.
 
-**Settings in every run:**
-- **Laptop on power saver, with turbo off.** Power saver alone leaves the processor's turbo on, and then the processor
-  alone drew about 24 W:
+**Settings:**
+- **Power saver, with the processor's turbo off** (power saver alone leaves it on):
   ```sh
   powerprofilesctl set power-saver
   echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
   ```
-- **Card limit 55 W**, the lowest this laptop accepts. It is set through the asus-armoury driver's `nv_tgp`;
-  `nvidia-smi -pl` is not supported on it.
-- **Card memory two steps down, to 9,001 MHz:** `sudo nvidia-smi -lmc 405,9001`. The 55 W limit covers the card's
-  memory as well as its core. At full memory speed the core ran at about 700 MHz on long prompts; at 9,001 it ran at
-  1,000-1,150 MHz, for about 40% faster prompts at the same 55 W. The next step down, 810 MHz, is far too slow.
-- **`STRATA_POOL_SPIN_US=0`** (in the example config): the CPU workers stop spinning while they wait, for about 7 W
-  less at 2-3% of the speed.
+- **Card limit 55 W**, the lowest this laptop accepts (asus-armoury `nv_tgp`; `nvidia-smi -pl` is not supported).
+- **Card memory at 9,001 MHz:** `sudo nvidia-smi -lmc 405,9001`. The 55 W covers the card's memory too, so slower memory
+  leaves more for its core: about 40% faster prompts than at full memory speed.
+- **On 70 W only, the card's core capped at 525 MHz:** `sudo nvidia-smi -lgc 210,525`.
+- `STRATA_POOL_SPIN_US=0`, as in the example config.
 
-**Measuring:**
-- **Battery flow** is the slope of the battery's charge counter over each request (+ charging, − draining). The counter
-  moves in 17 mWh steps, so a request under a minute reads ±1 W at best.
-- **A full battery cannot be read:** its counter stops at 100% even while the laptop draws more than the charger
-  gives. These runs started below full.
-- **The code answer** is two 1,024-token Python answers back to back, temperature 0. The other rows are the benchmark
-  method above.
-
-**70 W charger** (20 V × 3.5 A). The card's core also needs a clock cap: `sudo nvidia-smi -lgc 210,<MHz>`.
-
-8 GB RAM, core capped at 450 MHz:
+**100 W charger** (20 V × 5 A):
 
 | Request | Prompt, tokens/s | Writing, tokens/s | Battery |
 | --- | ---: | ---: | ---: |
-| Code answer | – | 20.1 | +4.6 W |
-| 8K | 497 | 16.8 | +4.3 W |
-| 16K | 597 | 18.1 | +1.6 W |
-| 32K | 562 | 19.2 | full* |
-| 64K | 604 | 18.6 | full* |
-| 128K | 567 | 15.4 | full* |
-| 151K | 565 | 16.2 | full* |
+| Code answer | – | 45.5 | +0.5 W |
+| 16K | 1,234 | 40.8 | +4.7 W |
+| 32K | 1,132 | 41.1 | +10.3 W |
+| 64K | 1,238 | 39.6 | +7.6 W |
 
-\* The battery reached 100% here, so its flow could not be read. At 600 MHz, measured below full, the whole sweep
-still came out charging (+0.4 W; worst row −0.3 W), and 450 MHz draws about 4 W less than that.
-
-32 GB RAM, core capped at 525 MHz:
+**70 W charger** (20 V × 3.5 A):
 
 | Request | Prompt, tokens/s | Writing, tokens/s | Battery |
 | --- | ---: | ---: | ---: |
@@ -329,48 +310,15 @@ still came out charging (+0.4 W; worst row −0.3 W), and 450 MHz draws about 4 
 | 32K | 687 | 26.9 | +1.3 W |
 | 64K | 719 | 26.7 | +1.3 W |
 | 128K | 678 | 22.9 | +1.6 W |
-| 151K | 671 | 25.1 | ±0 W† |
+| 151K | 671 | 25.1 | ±0 W |
 
-† The charger was swapped during this row.
-
-**100 W charger** (20 V × 5 A). No clock cap needed.
-
-16 GB RAM:
-
-| Request | Prompt, tokens/s | Writing, tokens/s | Battery |
-| --- | ---: | ---: | ---: |
-| Code answer | – | 33.4 | +3.8 W |
-| 8K | 933 | 29.2 | +2.0 W |
-| 16K | 1,168 | 33.8 | +6.2 W |
-| 32K | 1,077 | 34.3 | +6.9 W |
-| 64K | 1,205 | 32.4 | +6.3 W |
-| 128K | 1,134 | 29.9 | +6.1 W |
-| 151K | 1,139 | 28.7 | +6.5 W |
-
-32 GB RAM, with the card's memory at each speed:
-
-| Card memory | Prompt 16K / 32K / 64K, tokens/s | Code answer, tokens/s | Battery (mean) |
-| --- | ---: | ---: | ---: |
-| 14,001 MHz (full) | 876 / 827 / 868 | 40.6 | +7 W |
-| 10,820 MHz | 1,071 / 1,025 / 1,117 | 44.7 | +7.6 W |
-| 9,001 MHz | 1,234 / 1,132 / 1,238 | 45.5 | +5.7 W |
-
-**What did not fit or did not help:**
-- **8 GB with the card uncapped at 55 W drains even on 100 W** (about −19 W). With so few experts in RAM, the processor
-  works hard (about 28 W) to keep up.
-- **The card uncapped at 55 W on the 70 W charger drains** 9-22 W, at 16 GB, 32 GB and with every expert in RAM.
-- **A core clock offset** (+150 and +300 MHz through NVML) gave exactly the same tokens, but no speed under the 55 W
-  limit. An NVML memory offset has no effect at the 9,001 MHz step.
-- **Lowering the processor's sustained power limit** to 15 or 18 W changed nothing (see the next point).
-
-**Two things to know:**
-- **The processor does not behave the same from run to run on power saver.** With identical settings, 32 GB writing
-  ranged from 21-25 to 45-50 tokens/s, with the processor drawing between 7 and 35 W. The tables show runs where it
-  wrote at full speed while the battery charged. Balanced mode, with turbo still off, kept it consistently fast
-  (about 1.8 GHz: writing 48-53, prompts 1,130-1,230 tokens/s), but drew 24-31 W, a few watts more than the 100 W
-  charger supplies at 32 GB.
-- **Stopping the server in the middle of an answer** left the card at full clock (about 55 W) with no program on it,
-  until another program opened the card. On a battery, check `nvidia-smi` after a stop.
+**Notes:**
+- **Battery** is the slope of the battery's charge counter over each request (+ charging); a full battery cannot be
+  read, so these runs started below full. The code answer is a 1,024-token Python answer, temperature 0.
+- **On power saver the processor varies from run to run**, so writing can come out lower (down to about half) at the
+  same settings.
+- **Stopping the server mid-answer** has left the card at full clock (about 55 W) with no program on it until another
+  program opened the card: check `nvidia-smi` after a stop.
 
 ## License
 
