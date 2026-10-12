@@ -1,7 +1,7 @@
-# Strata patches: Radeon 890M and RTX 5080 Laptop
+# Strata patches: Radeon 890M, RTX 5080 Laptop and Radeon AI PRO R9700
 
-Two patch sets for [Strata](https://github.com/Niko1221/Strata) (base commit `fb58e0d`) that run Qwen3.8-Flash-Next
-faster on two kinds of laptop graphics:
+Patch sets for [Strata](https://github.com/Niko1221/Strata) that run Qwen3.8-Flash-Next faster on a laptop's
+integrated and discrete graphics (base commit `fb58e0d`) and on a desktop Radeon (base commit `7695859a`):
 
 - **`strata-gfx1150-890m.patch`**: the Radeon 890M (gfx1150) integrated GPU. Faster prompt reading (about 4x) and
   writing (about 1.6x) for the Q2_0 model, all with the same output as before.
@@ -9,8 +9,13 @@ faster on two kinds of laptop graphics:
   are read straight from one or two SSDs as they are needed, with an optional RAM cache. With IQ3_S on an
   RTX 5080 Laptop it writes about 3x faster at an 8 GB RAM cap than without it.
 
-Both apply to a clean Strata checkout, alone or together. The 890M results for IQ3_S and for little memory below
-use both.
+- **`strata-r9700.patch`**: the Radeon AI PRO R9700 (gfx1201). FP8 matrix-core kernels for a prompt's expert and dense
+  products, the low-RAM mode carried forward to upstream `7695859a`, a RAM share for the experts a long prompt borrows
+  from the GPU cache, and fixes for GPU stalls. A 16K prompt reads at about 3,650 tokens/s with the experts in RAM
+  (Strata 0.1.41: about 1,500) and about 2,775 in a 28 GB setup that runs beside ComfyUI.
+
+The first two apply to a clean `fb58e0d` checkout, alone or together; the 890M results for IQ3_S and for little memory
+below use both. The R9700 patch applies to `7695859a` on its own and already contains the low-RAM mode.
 
 ## Apply
 
@@ -22,6 +27,13 @@ git apply /path/to/strata-patches/patches/strata-gfx1150-890m.patch      # Radeo
 git apply /path/to/strata-patches/patches/strata-rtx5080-lowram.patch    # low-RAM mode (NVIDIA; also the 890M with IQ3_S)
 ```
 
+For the R9700, on upstream `7695859a` instead:
+
+```sh
+git checkout 7695859a
+git apply /path/to/strata-patches/patches/strata-r9700.patch            # Radeon AI PRO R9700 (with the low-RAM mode)
+```
+
 On a newer Strata, `git apply --3way` may resolve small differences; if a hunk still fails, check out `fb58e0d`.
 
 Then set Strata up as usual (its `setup.py` downloads the model and builds the pack); the patches change none of
@@ -30,6 +42,7 @@ that. Build the engine with:
 ```sh
 tools/gfx1150/build-gfx1150-sdk.sh <ROCm 10 SDK dir> <build dir> strata-890m   # Radeon 890M, AMD TheRock ROCm 10
 CUDAHOSTCXX=g++-15 tools/rtx5080/build-rtx5080.sh <build dir> strata-5080      # RTX 50-series (sm_120), CUDA 13
+tools/r9700/build-r9700.sh <ROCm 10 SDK dir> <build dir>                     # R9700 / RX 9070 (gfx1201), ROCm 10
 ```
 
 `CUDAHOSTCXX` is only needed when the system compiler is newer than CUDA accepts.
@@ -105,6 +118,38 @@ as any change of cache size does in Strata: lazy loading's spare memory, `--kv-g
 | --- | --- | --- |
 | IQ3_S with `STRATA_EXPERT_SKIP=0.1` | 95.0% / 97.4% | 0.021 / 0.017 |
 | Q2_0, for comparison | 82.5% / 94.7% | 0.202 / 0.052 |
+
+## What the R9700 patch changes
+
+Everything is opt-in. `configs/strata-r9700-allram.json` (experts in RAM, about 55 GB) and `configs/strata-r9700-28g.json`
+(28 GB, 256K context) set it all.
+
+| Setting | What it does |
+| --- | --- |
+| `STRATA_PF_FUSED_F8=1` | A prompt's expert products on the FP8 matrix cores (`v_wmma_f32_16x16x16_fp8_fp8`). Weights are decoded to E4M3 at one scale per row, activations at one scale per token, and the products add up in FP32 without the per-32-value scaling that bound the int8 kernels. Gate/up and down; `STRATA_PF_FUSED_F8D=0` keeps the int8 down. With `STRATA_PF_FUSED=1`. |
+| `STRATA_PF_FP8=1` | A prompt's dense products (the GGUF's quantized attention, GDN and shared-expert weights) as FP8 hipBLASLt products, one scale per weight row. |
+| `STRATA_PF_DM16=1` | The experts' outputs stored as BF16 before they are combined: half the memory traffic. |
+| `STRATA_BUDGET_LEND_GIB=X` | With `--resident-budget-gib`, up to X GiB of the RAM share keep the experts a long prompt borrows from the GPU cache, so they come back from RAM, not the drive, after the prompt. 3 suits mixed prompt sizes; 6.5 favours 16K+, at a cost to 4K. |
+| `STRATA_REFILL_ASYNC=1` | With the experts in RAM: the borrowed cache slots are refilled while the answer starts, not before it. |
+| `STRATA_WARMUP_TOKENS=4096` | The server reads one throwaway prompt at start. Without it, the first long prompt after a start sometimes read at a fifth of the speed. |
+| `STRATA_ARENA_MLOCK=1` | Locks the experts' RAM copy (needs a memory-lock limit, see below). |
+| Prompt ring | With `STRATA_HIP_WMMA=1`, prompts up to 8K keep 384 experts in flight instead of 96: 4K prompts about 12% faster. `STRATA_PREFILL_RING_SMALL`, `STRATA_PREFILL_RING_SMALL_MAX` set it. |
+
+Upstream switches the configs also set: `STRATA_HIP_WMMA=1 STRATA_SELECT_WMMA=1` (attention on the matrix cores),
+`STRATA_PF_FUSED=1` (the fused experts for every format; the SC117 model's 20 IQ2_S layers otherwise run on MMQ),
+`STRATA_ROUTE_RESIDENT=1` (about 3% faster code answers), `STRATA_UNBUFFERED_LOAD=1` and `HSA_USERPTR_FOR_PAGED_MEM=0`.
+
+**Output.** The FP8 and BF16 settings change the numbers. On 7 questions about a 20,000-token document, answered
+greedily, each step kept 6 answers word for word and reworded one summary.
+
+**Stalls.** With the experts in RAM, the GPU's queues were suspended for 2 to 17 s per run of prompts, and up to 70 s
+during loading: the kernel moved pages of the RAM copy, and the driver stops the GPU to map them again. Count it in
+`/sys/class/kfd/kfd/proc/<engine pid>/stats_*/evicted_ms`. What brought it to 0.04-0.2 s per run:
+
+- `STRATA_UNBUFFERED_LOAD=1`: the 55 GB load no longer fills the file cache.
+- `HSA_USERPTR_FOR_PAGED_MEM=0`, as in upstream's report #750.
+- Kernel settings: transparent huge pages `madvise`, `vm.compaction_proactiveness = 0` and
+  `vm.compact_unevictable_allowed = 0`, with `STRATA_ARENA_MLOCK=1` and `LimitMEMLOCK=infinity` for the server's unit.
 
 ## Benchmarks
 
@@ -319,6 +364,46 @@ The fastest settings found that keep the battery charging while the server works
   same settings.
 - **Stopping the server mid-answer** has left the card at full clock (about 55 W) with no program on it until another
   program opened the card: check `nvidia-smi` after a stop.
+
+### Radeon AI PRO R9700, IQ3_S, R9700 patch
+
+- **Hardware:** AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600, Radeon AI PRO R9700 32 GB at a 230 W power limit
+  (default 300 W), Patriot Viper VP4300L 2 TB (about 3.55 GB/s).
+- **Software:** Debian 13 with kernel 7.1.8, ROCm 10.2.0a20261009 (TheRock), Strata `7695859a` with the patch.
+- **Method:** as above, after the start-up warm-up. One run per row; a range is two or three runs.
+
+Prompt reading, tokens/s:
+
+| Setup | RAM | 4K | 16K | 32K |
+| --- | ---: | ---: | ---: | ---: |
+| Strata 0.1.41 + low-RAM patch (before) | 24 GB | – | – | 1,302 |
+| Strata 0.1.41, experts in RAM (before) | 77 GB | – | – | 1,515 |
+| `strata-r9700-allram.json` | about 55 GB | 2,850-2,890 | 3,600-3,680 | 3,300-3,750 |
+| `--resident-budget-gib 29`, `STRATA_BUDGET_LEND_GIB=7` | 36 GB | 2,652 | 3,469-3,482 | 2,911-3,306 |
+| `strata-r9700-28g.json` (256K context) | 28 GB | 1,812-2,221 | 2,762-2,786 | 2,424 |
+| `--resident-budget-gib 17`, `STRATA_BUDGET_LEND_GIB=3`, 128K context | 24 GB | 1,604-1,857 | 2,686-2,722 | 2,391 |
+
+Writing after each prompt: 60-71 tokens/s in every setup. A 1,024-token code answer: about 100 tokens/s with the
+experts in RAM, 82-94 in 28 GB.
+
+Long context, 24 GB, 256K context (`--resident-budget-gib 14.5`: the K/V takes 3.1 GB of RAM at 256K):
+
+| Prompt | Prompt, tokens/s | Writing, tokens/s |
+| --- | ---: | ---: |
+| 64K | 2,951 | 63.9 |
+| 128K | 2,784 | 61.0 |
+| 240K (242,537 tokens) | 2,736 | 59.6 |
+
+**Beside ComfyUI** (`strata-r9700-28g.json`; ComfyUI renders MiniMax H3 on another card, an RTX 3080):
+
+| | Alone | Both at once |
+| --- | ---: | ---: |
+| Short H3 render | 53.85 s | 54.0 s |
+| Long H3 clip (it asks Strata for its frame prompts) | 596-703 s before | 591 s |
+| Strata 16K prompt, tokens/s | about 2,780 | 2,677-2,807 |
+| Strata code answer, tokens/s | 82 | 82-94 |
+
+The lowest available RAM during the long clip was 15.1 GiB of 94.
 
 ## License
 

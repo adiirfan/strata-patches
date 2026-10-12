@@ -1,0 +1,2621 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 5d16d997..9bcb1775 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -31,6 +31,7 @@
+ #include <cstddef>
+ #include <condition_variable>
+ #include <deque>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -174,6 +175,11 @@ public:
+     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
+     /// returned, where a pageable one is staged by the driver before it returns.)
+     virtual void note_async_read(const uint8_t* blob, void* stream) { (void) blob; (void) stream; }
++    /// `blob`, but nullptr instead of waiting when the blob is still being read (STRATA_POOL_EARLY: the pool computes
++    /// what is here first).  Defaults to `blob`.
++    virtual const uint8_t* blob_if_ready(int64_t layer, int64_t expert) { return blob(layer, expert); }
++    /// STRATA_EXPERT_SKIP: whether the blob is in RAM already or on its way (no new read needed).  Defaults to true.
++    virtual bool has_blob(int64_t layer, int64_t expert) { (void) layer; (void) expert; return true; }
+ 
+     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
+     virtual int64_t reads() const { return 0; }
+@@ -335,6 +341,10 @@ struct GpuPlanSink {
+ /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
+ struct ForesightSwap;
+ 
++/// STRATA_EXPERT_SKIP: the routing weights of the window the verifier is serving (its mapped host copy, published
++/// with Verifier::set_always_publish), set around each pool call; nullptr when not published.
++extern thread_local const float* g_pool_weights;
++
+ struct ExpertDispatch {
+     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
+     strata::kernels::cpu::ExpertPool* pool = nullptr;
+@@ -367,6 +377,7 @@ struct ExpertDispatch {
+     int64_t cache_hits = 0;      ///< lookups already resident
+     int64_t cache_admitted = 0;  ///< lookups that took a slot
+     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
++    int64_t skipped = 0;         ///< STRATA_EXPERT_SKIP: entries left out (their expert in no tier, light)
+     void* cache_stream = nullptr;
+     const char* cache_fail = nullptr;
+ 
+@@ -656,6 +667,22 @@ public:
+     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
+     bool recheck_unbuffered(std::string& why);
+     bool unbuffered() const { return !direct_.empty(); }
++    /// STRATA_PROMPT_DIRECT=1 (Linux; the GGUF in place without a RAM budget): O_DIRECT descriptors for the prompt
++    /// path only - copy_blobs (the prompt stager, the refill after a prompt) reads through read_direct, while the
++    /// mapped reads and the io prefetch keep the file cache.  Under a tight RAM cap the cached reads, not the drive,
++    /// set the prompt's rate.  False (and `why`) when it cannot open them; startup only.
++    bool open_prompt_direct(std::string& why);
++    /// STRATA_EXPERT_MIRROR is open: the direct reads split every layer between the shard and its copy.
++    bool mirrored() const { return mirror_fd_ >= 0; }
++    /// STRATA_DECODE_DIRECT=1 (after open_prompt_direct; the GGUF in place): the decode's blob reads - the read-ahead
++    /// workers and a layer's misses - go through read_direct too, on both drives with STRATA_EXPERT_MIRROR.  The GGUF
++    /// in place assembles every blob in a stage buffer anyway, so no kernel reads those pages from the file cache.
++    void set_decode_direct(bool on) { decode_direct_ = on && !pp_direct_.empty() && !role_ptr_.empty(); }
++    bool decode_direct() const { return decode_direct_; }
++    /// STRATA_STAGE_KEEP=N: the stage pool grows to N buffers before it reuses one, so the last N blobs read stay in
++    /// RAM (with direct reads nothing else keeps them).  The buffers are sized exactly per blob size, and each size
++    /// keeps its share of N (by the layers that have it): N x the mean blob of RAM.  0 (the default): as before.
++    void set_stage_keep(size_t n);
+     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
+     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
+     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
+@@ -681,6 +708,8 @@ public:
+     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
+ 
+     const uint8_t* blob(int64_t layer, int64_t expert) override;
++    const uint8_t* blob_if_ready(int64_t layer, int64_t expert) override;
++    bool has_blob(int64_t layer, int64_t expert) override;
+     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
+     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
+     void note_async_read(const uint8_t* blob, void* stream) override;
+@@ -738,6 +767,9 @@ public:
+         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
+         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
+         uint64_t crit_n = 0;
++        uint64_t hand_hit = 0, hand_late = 0, hand_late_us = 0;   ///< decode hand-out: staged already / still being read (wait)
++        uint64_t hand_now = 0, hand_now_us = 0, hand_now_calls = 0; ///< read on the spot by the layer (prefetch's fill_many)
++        uint64_t rd_io_us = 0, rd_copy_us = 0, rd_n = 0;           ///< the decode's direct reads: drive wait, bounce copy
+     };
+     IoCounters io_counters() const;
+ 
+@@ -745,7 +777,8 @@ private:
+     const uint8_t* resident_blob(size_t index) const;
+     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
+     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
+-    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
++    /// `stage_dst`: dst is a stage buffer (4 KiB-aligned, whole 4 KiB blocks: a packed blob may be read straight in).
++    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst = false) const;
+     bool open_gguf(std::string& err);
+     const uint8_t* staged_blob(int64_t layer, int64_t expert);
+     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
+@@ -756,12 +789,28 @@ private:
+     void fill_many(const std::vector<Fill>& todo);
+     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
+     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
+-    bool read_direct(const Fill* fills, size_t n) const;
++    /// `decode`: the decode's scattered blobs (STRATA_EXPERT_MIRROR_DECODE_SHARE splits them), else the prompt's.
++    bool read_direct(const Fill* fills, size_t n, bool decode = false, bool stage_dst = false) const;
+     bool open_direct(std::string& why);
+     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
+     bool map_view(std::string& why);
+     std::vector<std::string> paths_;          ///< the mapped files, as maps_
+     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
++    std::vector<void*> pp_direct_;            ///< open_prompt_direct: per file, an O_DIRECT fd for copy_blobs only
++    int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
++    int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
++    int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
++    int64_t mirror_cut_decode_ = 0;           ///< the same for the decode's reads (STRATA_EXPERT_MIRROR_DECODE_SHARE)
++    bool packed_ = false;                     ///< the copy is expert_pack.py's: whole blobs from packed_first_ on
++    int64_t packed_first_ = 0;
++    std::vector<uint64_t> packed_off_, packed_stride_;   ///< per layer: its first blob's offset, the blob stride
++    bool decode_direct_ = false;              ///< set_decode_direct
++    size_t stage_keep_ = 0;                   ///< set_stage_keep
++    std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
++    std::map<uint64_t, size_t> stage_class_keep_;              ///< STRATA_STAGE_KEEP: buffers kept per blob size
++    std::map<uint64_t, std::vector<size_t>> stage_class_bufs_; ///< STRATA_STAGE_KEEP: the buffers of each blob size
++    bool open_mirror(const std::string& path, double share, std::string& err);
++    bool open_packed(const std::string& path, std::string& err);
+     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
+     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
+@@ -831,12 +880,15 @@ private:
+     std::mutex io_mu_;
+     std::condition_variable io_cv_;
+     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
++    std::deque<Fill> io_now_q_;                      ///< STRATA_DECODE_DIRECT: a layer's claimed blobs, read before io_q_
+     bool io_quit_ = false;
+     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
+     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
+     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
+         io_crit_us_{0}, io_crit_n_{0};
++    mutable std::atomic<uint64_t> hand_hit_{0}, hand_late_{0}, hand_late_us_{0}, hand_now_{0}, hand_now_us_{0}, hand_now_calls_{0};
++    mutable std::atomic<uint64_t> rd_io_us_{0}, rd_copy_us_{0}, rd_n_{0};
+     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
+     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
+     int spans(int64_t layer, int64_t expert, Span* out) const;
+@@ -866,6 +918,7 @@ private:
+     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
+     bool complement_ready_ = false;
+     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
++    int64_t budget_lend_keep_from_ = -1;   // STRATA_BUDGET_LEND_GIB: the first slot whose expert the budget keeps in RAM
+     int64_t complement_lent_slots_ = 0;
+     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+diff --git a/include/strata/prefill/gemm.hpp b/include/strata/prefill/gemm.hpp
+index 935f1a9a..4ed23c36 100644
+--- a/include/strata/prefill/gemm.hpp
++++ b/include/strata/prefill/gemm.hpp
+@@ -85,6 +85,17 @@ private:
+     void* mmq_ctx_ = nullptr;
+     void* mmq_buf_ = nullptr;
+     bool mmq_failed_ = false;
++    /// STRATA_PF_FP8=1 (HIP, hipBLASLt): native() as an FP8 (E4M3) product - the weight per row, the activations per
++    /// slice, both scales applied by hipBLASLt's alpha vector; false (nothing launched) where it does not apply.
++    bool native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
++                    int64_t ldy, float beta);
++    uint8_t* fp8_w_ = nullptr;      // the weight in E4M3
++    int64_t fp8_w_bytes_ = 0;
++    float* fp8_vec_ = nullptr;      // per weight row: its scale, then the product's alpha (row scale x activation scale)
++    int64_t fp8_vec_rows_ = 0;
++    uint32_t* fp8_amax_ = nullptr;  // the activation slice's largest |x| (float bits)
++    bool fp8_failed_ = false;
++    void* fp8_cache_ = nullptr;     // descriptors and algorithm per shape
+     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
+     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+ };
+diff --git a/include/strata/prefill/kernels.hpp b/include/strata/prefill/kernels.hpp
+index 34cc5f66..89a3400a 100644
+--- a/include/strata/prefill/kernels.hpp
++++ b/include/strata/prefill/kernels.hpp
+@@ -86,6 +86,9 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
+ /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
+ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+ /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
++/// STRATA_PF_DM16: the same with D's rows in BF16 (fused::dm16_on()); shared and bo 16-byte aligned.
++void moe_combine_bf16(const void* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
++                      int64_t T, void* stream);
+ void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                  int64_t T, void* stream);
+ /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *
+diff --git a/include/strata/prefill/moe_fused_iq.hpp b/include/strata/prefill/moe_fused_iq.hpp
+index 7e63df9b..91ecf21c 100644
+--- a/include/strata/prefill/moe_fused_iq.hpp
++++ b/include/strata/prefill/moe_fused_iq.hpp
+@@ -32,6 +32,13 @@ bool native_supported(int gu_type, int d_type);
+ /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)): int8 per 32 values in natural order, the native kernels' form.
+ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
+ 
++/// STRATA_PF_FUSED_F8=1 on gfx12: this gate/up type's product runs on the FP8 matrix cores (its activations must then come
++/// from quantize_act_f8, E4M3 at one scale per token, in the same layout).
++bool native_f8_gu(int gu_type);
++/// STRATA_PF_DM16=1 on gfx12: experts_native stores the down rows as BF16 (2 bytes per value in `dm`); moe_combine_bf16 reads them.
++bool dm16_on();
++void quantize_act_f8(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
++
+ /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
+ /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
+ /// rows of `group`.  `dm` 16-byte aligned (gfx12 stores float4; checked there - the prompt path's buffers are 256-aligned
+diff --git a/serve/server.py b/serve/server.py
+index cb5543ee..d3b19ec7 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -6137,6 +6137,37 @@ def check_request_sampling(req) -> None:
+             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+ 
+ 
++def warmup_prompt(port: int, api_key: str, from_config: str = "") -> None:
++    """STRATA_WARMUP_TOKENS=N: one throwaway prompt of about N tokens (one token answered) before the server says it is
++    ready.  R9700, all experts in RAM: the first long prompt after a start sometimes read at 550-1,750 tok/s (the GPU
++    waiting up to 20 s for its first expert copies) where the next ones read at 3,300; after a 4K first prompt, they did
++    not.  0 or unset: nothing.  The environment wins over the config's "env"."""
++    try:
++        n = int(os.environ.get("STRATA_WARMUP_TOKENS", "") or from_config or 0)
++    except ValueError:
++        n = 0
++    if n <= 0:
++        return
++    import random
++    import urllib.request
++    filler = ("The lighthouse keeper wrote down the weather, the ships that passed and the state of the lamp every "
++              "evening, and on the last page of each month he added up the hours the light had burned. ")
++    text = "Warm-up %d.\n\n" % random.randint(0, 10 ** 9) + filler * max(1, n // 40) + "\nSay OK."
++    body = {"model": "x", "messages": [{"role": "user", "content": text}], "max_tokens": 1, "temperature": 0}
++    headers = {"Content-Type": "application/json"}
++    if api_key:
++        headers["Authorization"] = "Bearer " + api_key
++    t0 = time.monotonic()
++    try:
++        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), headers)
++        with urllib.request.urlopen(req, timeout=600) as r:
++            done = json.load(r).get("timings", {})
++        print(f"[strata] warm-up prompt: {done.get('prompt_n', '?')} tokens in {time.monotonic() - t0:.1f} s "
++              f"(STRATA_WARMUP_TOKENS={n})", flush=True)
++    except Exception as e:   # a failed warm-up costs nothing but the warm-up
++        print(f"[strata] warm-up prompt failed: {e}", flush=True)
++
++
+ def main() -> int:
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+@@ -6400,6 +6431,7 @@ def main() -> int:
+         hub.start()
+         atexit.register(hub.close)                      # the servers Strata started end with it
+     httpd = serve(svc, host=a.host, port=a.port)
++    warmup_prompt(a.port, svc.api_key, str(((cfg or {}).get("env") or {}).get("STRATA_WARMUP_TOKENS", "")))
+     svc.start_idle_unload()
+     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index ad28f56f..8500dcbd 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -25,6 +25,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <cmath>
+ #include <deque>
+ #include <fstream>
+ #include <filesystem>
+@@ -630,6 +631,9 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
+     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
+     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
+     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
++    c.hand_hit = hand_hit_.load(); c.hand_late = hand_late_.load(); c.hand_late_us = hand_late_us_.load();
++    c.hand_now = hand_now_.load(); c.hand_now_us = hand_now_us_.load(); c.hand_now_calls = hand_now_calls_.load();
++    c.rd_io_us = rd_io_us_.load(); c.rd_copy_us = rd_copy_us_.load(); c.rd_n = rd_n_.load();
+     return c;
+ }
+ 
+@@ -679,6 +683,15 @@ void FileExpertSource::io_stop() {
+     for (std::thread& t : io_workers_)
+         if (t.joinable()) t.join();
+     io_workers_.clear();
++    for (std::deque<Fill> left; ;) {   // claimed blobs a layer waits for: read them here
++        {
++            std::lock_guard<std::mutex> lk(io_mu_);
++            left.swap(io_now_q_);
++        }
++        if (left.empty()) break;
++        for (const Fill& f : left) (void) fill_stage(f.v, f.layer, f.e, f.dst);
++        left.clear();
++    }
+ #if defined(__linux__)
+     for (int f : io_fds_) ::close(f);
+ #endif
+@@ -706,8 +719,15 @@ void FileExpertSource::io_worker() {
+         int32_t layer, expert;
+         {
+             std::unique_lock<std::mutex> lk(io_mu_);
+-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
++            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_now_q_.empty(); });
+             if (io_quit_) return;
++            if (!io_now_q_.empty()) {   // a layer is waiting for this one (prefetch handed it over, claimed)
++                const Fill f = io_now_q_.front();
++                io_now_q_.pop_front();
++                lk.unlock();
++                (void) fill_stage(f.v, f.layer, f.e, f.dst);
++                continue;
++            }
+             layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+             expert = io_q_.back().second;
+             io_q_.pop_back();
+@@ -740,7 +760,7 @@ void FileExpertSource::io_worker() {
+             continue;
+         }
+         uint64_t total = 0;
+-        if (cached_bytes(layer, expert, total, false) >= total) {
++        if (!decode_direct_ && cached_bytes(layer, expert, total, false) >= total) {   // direct: never cached
+             io_pf_skips_.fetch_add(1, std::memory_order_relaxed);
+             continue;
+         }
+@@ -755,7 +775,7 @@ void FileExpertSource::io_worker() {
+             stage_pf_[v] = 1;
+             dst = stage_buf_[v].get();
+         }
+-        const bool ok = copy_from_files(layer, expert, dst);
++        const bool ok = copy_from_files(layer, expert, dst, true);
+         io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
+         if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+         {
+@@ -1033,6 +1053,13 @@ void FileExpertSource::close() {
+     paths_.clear();
+     for (void* h : direct_) close_direct(h);
+     direct_.clear();
++    for (void* h : pp_direct_) close_direct(h);
++    pp_direct_.clear();
++#if defined(__linux__)
++    if (mirror_fd_ >= 0) ::close(mirror_fd_);
++#endif
++    mirror_fd_ = mirror_main_ = -1;
++    packed_ = false;
+     {
+         std::lock_guard<std::mutex> lk(stage_mu_);
+         // the buffers' last copies end before they are freed (#1237)
+@@ -1043,6 +1070,8 @@ void FileExpertSource::close() {
+         stage_epoch_.clear();
+         stage_used_.clear();
+         stage_busy_.clear();
++        stage_cap_.clear();
++        stage_class_bufs_.clear();
+         stage_pf_.clear();
+         stage_of_.clear();
+         stage_blob_ = 0;
+@@ -1176,17 +1205,26 @@ bool FileExpertSource::open_gguf(std::string& err) {
+             role_bytes_[i] = per[r];
+         }
+     }
++    // STRATA_EXPERT_MIRROR=<file> (opt-in, Linux): a copy of this shard on a second drive - whole, or holding only the
++    // experts it serves (tools/rtx5080/expert_mirror.py).  The direct reads (read_direct: STRATA_PROMPT_DIRECT=1, or an
++    // unbuffered file tier) take every layer's experts from mirror_cut_ on from it - STRATA_EXPERT_MIRROR_SHARE of
++    // them, default 0.5 - so both drives serve each layer at once (the prompt stager finishes a layer before it
++    // starts the next).  The mapped reads stay on the shard.  Same bytes at the same offsets, so the same answers.
++    if (const char* mv = std::getenv("STRATA_EXPERT_MIRROR"); mv != nullptr && mv[0] != '\0') {
++        const char* sv = std::getenv("STRATA_EXPERT_MIRROR_SHARE");
++        if (!open_mirror(mv, sv != nullptr ? std::atof(sv) : 0.5, err)) return false;
++    }
+     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
+     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
+     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+     return true;
+ }
+ 
+-bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
++bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst) const {
+     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+-    if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
++    if (!direct_.empty() || decode_direct_) {   // #286: from the drive; a failed read falls back to the mapping below
+         const Fill f{0, layer, expert, dst};
+-        if (read_direct(&f, 1)) return true;
++        if (read_direct(&f, 1, true, stage_dst)) return true;
+         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+     }
+ #if defined(__linux__)
+@@ -1237,7 +1275,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
+ constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
+ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
+     if (pinned) (void) cudaFreeHost(p);
+-    else delete[] p;
++    else std::free(p);   // posix_memalign (claim_stage)
+ }
+ 
+ // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
+@@ -1261,12 +1299,23 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+     }
+     v = stage_buf_.size();
+     uint64_t oldest = std::numeric_limits<uint64_t>::max();
+-    for (size_t i = 0; i < stage_buf_.size(); ++i)
++    // STRATA_STAGE_KEEP: each blob size grows to its share of stage_keep_ buffers, exactly that size, before it reuses
++    // one of its own (the oldest), so the pool keeps the last blobs read; otherwise any buffer, as before
++    const auto ck = stage_class_keep_.find(layer_blob_bytes_[(size_t) (key / n_expert_)]);
++    const bool keep = ck != stage_class_keep_.end();
++    const uint64_t need = keep ? ck->first : stage_blob_;
++    std::vector<size_t>* mine = keep ? &stage_class_bufs_[need] : nullptr;
++    auto victim = [&](size_t i) {
+         if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
+             stage_used_[i] < oldest) {
+             oldest = stage_used_[i];
+             v = i;
+         }
++    };
++    if (!keep)
++        for (size_t i = 0; i < stage_buf_.size(); ++i) victim(i);
++    else if (mine->size() >= ck->second)
++        for (size_t i : *mine) victim(i);
+     if (v == stage_buf_.size()) {
+         // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
+         // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
+@@ -1282,15 +1331,20 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+         }
+         void* p = nullptr;
+         cudaError_t pin_err = cudaSuccess;
+-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
++        // 4 KiB-aligned and whole 4 KiB blocks: a packed copy's blob is read straight in (read_direct, stage_dst)
++        const size_t alloc = (size_t) ((need + 4095) / 4096 * 4096);
++        if (want_pin) pin_err = cudaHostAlloc(&p, alloc, cudaHostAllocDefault);
+         const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
+         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
+-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
++        void* q = nullptr;
++        uint8_t* raw = pinned ? (uint8_t*) p : (posix_memalign(&q, 4096, alloc) == 0 ? (uint8_t*) q : nullptr);
+         if (raw == nullptr) return false;
+         stage_buf_.emplace_back(raw, StageBufFree{pinned});
+         stage_idx_[raw] = stage_buf_.size() - 1;
+         stage_ev_.push_back(nullptr);
+         stage_ev_live_.push_back(0);
++        stage_cap_.push_back(need);
++        if (mine != nullptr) mine->push_back(stage_buf_.size() - 1);
+         if (pinned && !stage_pin_said_) {
+             stage_pin_said_ = true;
+             std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
+@@ -1338,7 +1392,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
+ // Fills buffer `v` (reserved by claim_stage) outside the lock, then publishes it.
+ bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst) {
+     const auto t0 = std::chrono::steady_clock::now();
+-    const bool ok = copy_from_files(layer, expert, dst);
++    const bool ok = copy_from_files(layer, expert, dst, true);
+     publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+     return ok;
+ }
+@@ -1411,7 +1465,15 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
+         dst = stage_buf_[v].get();
+         if (have) {
+             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
+-            stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
++            if (stage_busy_[v]) {
++                const auto w0 = std::chrono::steady_clock::now();
++                stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
++                hand_late_.fetch_add(1, std::memory_order_relaxed);
++                hand_late_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - w0).count(),
++                                        std::memory_order_relaxed);
++            } else {
++                hand_hit_.fetch_add(1, std::memory_order_relaxed);
++            }
+             if (stage_key_[v] != key) return nullptr;   // its fill failed
+             lk.unlock();
+             crit();
+@@ -1475,7 +1537,26 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
+             }
+         }
+     }
++    const auto f0 = std::chrono::steady_clock::now();
++    if (decode_direct_ && io_pf_ && !io_workers_.empty() && !todo.empty()) {
++        // STRATA_DECODE_DIRECT: the read-ahead workers read the layer's blobs in parallel, ahead of their predictions
++        // (one thread read them one batch at a time, then copied each out of its bounce buffer); staged_blob waits
++        {
++            std::lock_guard<std::mutex> lk(io_mu_);
++            for (const Fill& f : todo) io_now_q_.push_back(f);
++        }
++        io_cv_.notify_all();
++        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
++        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
+     fill_many(todo);
++    if (!todo.empty()) {
++        hand_now_.fetch_add(todo.size(), std::memory_order_relaxed);
++        hand_now_calls_.fetch_add(1, std::memory_order_relaxed);
++        hand_now_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - f0).count(),
++                               std::memory_order_relaxed);
++    }
+     if (io_pf_ && !todo.empty()) {
+         io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                               std::memory_order_relaxed);
+@@ -1518,7 +1599,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
+ 
+ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
+     if (todo.empty()) return;
+-    if (!direct_.empty()) {
++    if (!direct_.empty() || decode_direct_) {
+         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
+         // fill) on up to 4 threads, a decode layer's few misses on this one
+         std::atomic<size_t> next{0};
+@@ -1526,7 +1607,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
+             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
+                 const size_t k = std::min<size_t>(16, todo.size() - at);
+                 const auto t0 = std::chrono::steady_clock::now();
+-                const bool ok = read_direct(todo.data() + at, k);
++                const bool ok = read_direct(todo.data() + at, k, true, true);
+                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                 for (size_t i = at; i < at + k; ++i) {
+                     const Fill& f = todo[i];
+@@ -1631,6 +1712,180 @@ bool FileExpertSource::open_direct(std::string& why) {
+ #endif
+ }
+ 
++bool FileExpertSource::open_mirror(const std::string& path, double share, std::string& err) {
++#if defined(__linux__)
++    for (size_t f = 0; f < paths_.size(); ++f)
++        if (paths_[f] == gguf_) mirror_main_ = (int) f;
++    if (mirror_main_ < 0) { err = "STRATA_EXPERT_MIRROR: no experts in " + gguf_; return false; }
++    mirror_cut_ = n_expert_ - std::llround((double) n_expert_ * std::clamp(share, 0.0, 1.0));
++    {
++        // tools/rtx5080/expert_pack.py's layout: every served expert's blob (gate, up, down) in one 4 KiB-aligned piece
++        const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++        char magic[8] = {};
++        const bool is_pack = fh >= 0 && ::pread(fh, magic, 8, 0) == 8 && std::memcmp(magic, "STRPACK1", 8) == 0;
++        if (fh >= 0) ::close(fh);
++        if (is_pack) return open_packed(path, err);
++    }
++    struct stat a{}, b{};
++    if (::stat(gguf_.c_str(), &a) != 0 || ::stat(path.c_str(), &b) != 0 || a.st_size != b.st_size) {
++        err = "STRATA_EXPERT_MIRROR: " + path + " is missing or not the size of " + gguf_;
++        mirror_main_ = -1;
++        return false;
++    }
++    // a copy made for a smaller share has holes where these experts are: compare the first and last 4 KiB of every
++    // role's served range with the shard (a hole reads as zeros, and would compute with them)
++    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC), fm = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    bool same = fs >= 0 && fm >= 0;
++    int64_t bad_layer = -1;
++    std::vector<uint8_t> x(4096), y(4096);
++    for (int64_t l = 0; same && l < n_layers_ && mirror_cut_ < n_expert_; ++l)
++        for (int r = 0; same && r < 3; ++r) {
++            const size_t i = (size_t) (3 * l + r);
++            if (role_file_[i] != mirror_main_) continue;
++            const uint64_t per = role_bytes_[i], off = (uint64_t) (role_ptr_[i] - maps_[(size_t) mirror_main_].base);
++            const uint64_t lo = off + (uint64_t) mirror_cut_ * per, hi = off + (uint64_t) n_expert_ * per;
++            const size_t k = (size_t) std::min<uint64_t>(4096, hi - lo);
++            for (const uint64_t at : {lo, hi - k}) {
++                if (!pread_full(fs, x.data(), k, at) || !pread_full(fm, y.data(), k, at) || std::memcmp(x.data(), y.data(), k) != 0) {
++                    same = false;
++                    bad_layer = l;
++                    break;
++                }
++            }
++        }
++    if (fs >= 0) ::close(fs);
++    if (fm >= 0) ::close(fm);
++    if (same) mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    if (!same || mirror_fd_ < 0) {
++        err = !same ? "STRATA_EXPERT_MIRROR: " + path + " does not hold experts " + std::to_string(mirror_cut_) + ".. of layer " +
++                          std::to_string(bad_layer) + " as " + gguf_ + " does (made for a smaller STRATA_EXPERT_MIRROR_SHARE?)"
++                    : "STRATA_EXPERT_MIRROR: cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
++        mirror_fd_ = mirror_main_ = -1;
++        return false;
++    }
++    {
++        // scattered 2 MB reads (the decode's) run at about the same rate on both drives even where one is the faster at
++        // long ones, so the decode may split them differently from the prompt
++        const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE");
++        const double ds = dv != nullptr ? std::clamp(std::atof(dv), 0.0, 1.0) : std::clamp(share, 0.0, 1.0);
++        mirror_cut_decode_ = std::max(mirror_cut_, n_expert_ - (int64_t) std::llround((double) n_expert_ * ds));
++    }
++    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from the mirror %s\n",
++                 (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
++    return true;
++#else
++    (void) path; (void) share;
++    err = "STRATA_EXPERT_MIRROR: Linux only";
++    return false;
++#endif
++}
++
++void FileExpertSource::set_stage_keep(size_t n) {
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    stage_keep_ = n;
++    stage_class_keep_.clear();
++    if (n == 0 || n_layers_ <= 0 || (int64_t) layer_blob_bytes_.size() < n_layers_) return;
++    std::map<uint64_t, size_t> layers;
++    for (int64_t l = 0; l < n_layers_; ++l) ++layers[layer_blob_bytes_[(size_t) l]];
++    for (const auto& [bytes, count] : layers) stage_class_keep_[bytes] = std::max<size_t>(1, n * count / (size_t) n_layers_);
++}
++
++bool FileExpertSource::open_packed(const std::string& path, std::string& err) {
++#if defined(__linux__)
++    auto fail = [&](const std::string& why) { err = "STRATA_EXPERT_MIRROR: " + path + ": " + why; mirror_main_ = -1; return false; };
++    const int fh = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fh < 0) return fail("cannot open it");
++    std::vector<uint8_t> h((size_t) (40 + 24 * n_layers_));
++    const bool got = pread_full(fh, h.data(), h.size(), 0);
++    uint32_t ver = 0, nl = 0, ne = 0, first = 0;
++    uint64_t shard = 0;
++    if (got) {
++        std::memcpy(&ver, h.data() + 8, 4); std::memcpy(&nl, h.data() + 12, 4);
++        std::memcpy(&ne, h.data() + 16, 4); std::memcpy(&first, h.data() + 20, 4); std::memcpy(&shard, h.data() + 24, 8);
++    }
++    struct stat a{};
++    if (!got || ver != 1 || (int64_t) nl != n_layers_ || (int64_t) ne != n_expert_ || ::stat(gguf_.c_str(), &a) != 0 ||
++        (uint64_t) a.st_size != shard) {
++        ::close(fh);
++        return fail("its header does not match " + gguf_ + " (another model or quant?)");
++    }
++    packed_first_ = first;
++    packed_off_.assign((size_t) n_layers_, 0);
++    packed_stride_.assign((size_t) n_layers_, 0);
++    for (int64_t l = 0; l < n_layers_; ++l) {
++        uint64_t blob = 0;
++        std::memcpy(&blob, h.data() + 32 + 24 * l, 8);
++        std::memcpy(&packed_stride_[(size_t) l], h.data() + 40 + 24 * l, 8);
++        std::memcpy(&packed_off_[(size_t) l], h.data() + 48 + 24 * l, 8);
++        bool here = true;
++        for (int r = 0; r < 3; ++r) here = here && role_file_[(size_t) (3 * l + r)] == mirror_main_;
++        if (blob != layer_blob_bytes_[(size_t) l] || !here || packed_stride_[(size_t) l] % 4096 != 0 ||
++            packed_off_[(size_t) l] % 4096 != 0) {
++            ::close(fh);
++            return fail("layer " + std::to_string(l) + " does not match the engine's blobs");
++        }
++    }
++    mirror_cut_decode_ = mirror_cut_;
++    if (const char* dv = std::getenv("STRATA_EXPERT_MIRROR_DECODE_SHARE"); dv != nullptr)
++        mirror_cut_decode_ = n_expert_ - (int64_t) std::llround((double) n_expert_ * std::clamp(std::atof(dv), 0.0, 1.0));
++    if (std::min(mirror_cut_, mirror_cut_decode_) < packed_first_) {
++        ::close(fh);
++        return fail("it holds experts " + std::to_string(packed_first_) + ".. only (made for a smaller share)");
++    }
++    // spot check: every layer's first and last served blob against the shard (its first and last 4 KiB)
++    const int fs = ::open(gguf_.c_str(), O_RDONLY | O_CLOEXEC);
++    bool same = fs >= 0;
++    std::vector<uint8_t> x(4096), y(4096);
++    for (int64_t l = 0; same && l < n_layers_; ++l)
++        for (const int64_t e : {packed_first_, n_expert_ - 1}) {
++            const uint64_t at = packed_off_[(size_t) l] + (uint64_t) (e - packed_first_) * packed_stride_[(size_t) l];
++            const size_t g = (size_t) (3 * l), d3 = (size_t) (3 * l + 2);
++            const uint64_t g0 = (uint64_t) (role_ptr_[g] - maps_[(size_t) mirror_main_].base) + (uint64_t) e * role_bytes_[g];
++            const uint64_t d1 = (uint64_t) (role_ptr_[d3] - maps_[(size_t) mirror_main_].base) + (uint64_t) (e + 1) * role_bytes_[d3];
++            const size_t kg = (size_t) std::min<uint64_t>(4096, role_bytes_[g]), kd = (size_t) std::min<uint64_t>(4096, role_bytes_[d3]);
++            same = pread_full(fs, x.data(), kg, g0) && pread_full(fh, y.data(), kg, at) && std::memcmp(x.data(), y.data(), kg) == 0 &&
++                   pread_full(fs, x.data(), kd, d1 - kd) && pread_full(fh, y.data(), kd, at + layer_blob_bytes_[(size_t) l] - kd) &&
++                   std::memcmp(x.data(), y.data(), kd) == 0;
++            if (!same) { err = "layer " + std::to_string(l) + " expert " + std::to_string(e); break; }
++        }
++    if (fs >= 0) ::close(fs);
++    ::close(fh);
++    if (!same) return fail("its bytes differ from the shard at " + err);
++    mirror_fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    if (mirror_fd_ < 0) return fail(std::string("cannot open it with O_DIRECT (") + std::strerror(errno) + ")");
++    packed_ = true;
++    std::fprintf(stderr, "strata experts: the direct reads take experts %lld.. (the decode's %lld..) of every layer from "
++                         "the packed copy %s, one read per expert\n", (long long) mirror_cut_, (long long) mirror_cut_decode_, path.c_str());
++    return true;
++#else
++    (void) path;
++    err = "STRATA_EXPERT_MIRROR: Linux only";
++    return false;
++#endif
++}
++
++bool FileExpertSource::open_prompt_direct(std::string& why) {
++#if defined(__linux__)
++    if (!direct_.empty()) { why = "the file tier reads unbuffered already"; return false; }
++    if (paths_.empty()) { why = "no expert files open"; return false; }
++    for (const std::string& path : paths_) {
++        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++        if (fd < 0) {
++            why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + ")";
++            for (void* d : pp_direct_) close_direct(d);
++            pp_direct_.clear();
++            return false;
++        }
++        pp_direct_.push_back((void*) (intptr_t) fd);
++    }
++    why = "the prompt's expert copies and the refill after it read straight from the drive";
++    return true;
++#else
++    why = "Linux only";
++    return false;
++#endif
++}
++
+ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
+ #if defined(_WIN32) || defined(__linux__)
+     if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
+@@ -1851,7 +2106,7 @@ bool FileExpertSource::map_view(std::string& why) {
+ #endif
+ }
+ 
+-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
++bool FileExpertSource::read_direct(const Fill* fills, size_t n, bool decode, bool stage_dst) const {
+ #if defined(_WIN32)
+     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
+     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
+@@ -1973,8 +2228,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     // own context and aligned buffer, kept for its next batch, so concurrent batches never see each other's events.
+     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
+     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
+-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
+-    struct Req { int fd; uint64_t a0, size, pos; };
++    constexpr int kMirror = 1 << 30;   // Window::file of a read from STRATA_EXPERT_MIRROR's copy (mirror_fd_)
++    // to_dst: the window is read straight into dst (a packed blob into its stage buffer), not through the bounce buffer
++    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; bool to_dst = false; };
++    struct Req { int fd; uint64_t a0, size, pos; uint8_t* to; };
+     struct Scratch {
+         uint8_t* buf = nullptr;
+         size_t cap = 0;
+@@ -1992,6 +2249,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+         }
+     };
+     thread_local Scratch sc;
++    const std::vector<void*>& dv = direct_.empty() ? pp_direct_ : direct_;   // open_prompt_direct's when not unbuffered
++    if (dv.empty()) return false;
+     if (sc.ctx == 0 && syscall(SYS_io_setup, kDepth, &sc.ctx) != 0) {
+         sc.ctx = 0;
+         return false;   // no AIO (a seccomp profile, aio-max-nr): the caller falls back to the mapped copy
+@@ -2007,6 +2266,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
+             continue;
+         }
++        if (packed_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_)) {   // expert_pack.py: the blob in one piece
++            const uint64_t at0 = packed_off_[(size_t) f.layer] + (uint64_t) (f.e - packed_first_) * packed_stride_[(size_t) f.layer];
++            sc.win.push_back({kMirror, at0, packed_stride_[(size_t) f.layer], 0, layer_blob_bytes_[(size_t) f.layer], 0, f.dst, 0, 0,
++                              stage_dst && ((uintptr_t) f.dst & 4095) == 0});
++            continue;
++        }
+         uint64_t at = 0;
+         for (int r = 0; r < 3; ++r) {
+             const size_t i = (size_t) (3 * f.layer + r);
+@@ -2014,7 +2279,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             const Map& m = maps_[(size_t) role_file_[i]];
+             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
+             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
+-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
++            int file = role_file_[i];
++            if (!packed_ && mirror_fd_ >= 0 && file == mirror_main_ && f.e >= (decode ? mirror_cut_decode_ : mirror_cut_))
++                file = kMirror;   // same bytes, same offset
++            sc.win.push_back({file, a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
+             at += per;
+         }
+     }
+@@ -2028,7 +2296,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     int last_file = -1;
+     for (size_t w : sc.order) {
+         Window& x = sc.win[w];
+-        if (!sc.req.empty() && x.file == last_file) {
++        if (x.to_dst) {   // its own request, into its stage buffer
++            sc.req.push_back({mirror_fd_, x.a0, x.size, 0, x.dst});
++            last_file = -2;
++            x.req = sc.req.size() - 1;
++            x.in_req = 0;
++            continue;
++        }
++        if (!sc.req.empty() && x.file == last_file && sc.req.back().to == nullptr) {
+             Req& q = sc.req.back();
+             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
+             if (x.a0 <= end && std::max(end, xend) - q.a0 <= kMerge) {
+@@ -2041,7 +2316,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+                 continue;
+             }
+         }
+-        sc.req.push_back({(int) (intptr_t) direct_[(size_t) x.file], x.a0, x.size, total});
++        sc.req.push_back({x.file == kMirror ? mirror_fd_ : (int) (intptr_t) dv[(size_t) x.file], x.a0, x.size, total, nullptr});
+         total += x.size;
+         last_file = x.file;
+         x.req = sc.req.size() - 1;
+@@ -2059,6 +2334,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+     sc.cbp.resize(sc.cb.size());
+     sc.ev.resize(sc.cb.size());
+     bool ok = true;
++    const auto rd_t0 = std::chrono::steady_clock::now();
+     for (size_t w0 = 0; ok && w0 < sc.req.size(); w0 += (size_t) kDepth) {
+         const size_t wn = std::min<size_t>((size_t) kDepth, sc.req.size() - w0);
+         for (size_t j = 0; j < wn; ++j) {
+@@ -2067,7 +2343,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+             std::memset(&c, 0, sizeof c);
+             c.aio_lio_opcode = IOCB_CMD_PREAD;
+             c.aio_fildes = (uint32_t) r.fd;
+-            c.aio_buf = (uint64_t) (uintptr_t) (sc.buf + r.pos);
++            c.aio_buf = (uint64_t) (uintptr_t) (r.to != nullptr ? r.to : sc.buf + r.pos);
+             c.aio_nbytes = r.size;
+             c.aio_offset = (int64_t) r.a0;
+             c.aio_data = (uint64_t) (w0 + j);
+@@ -2101,11 +2377,19 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+         }
+     }
+     if (!ok) return false;
++    const auto rd_t1 = std::chrono::steady_clock::now();
+     for (const Window& x : sc.win) {
+         // a request may run past the end of the file: only the role's own bytes have to arrive
+         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
++        if (x.to_dst) continue;   // already in place
+         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+     }
++    if (decode) {
++        const auto rd_t2 = std::chrono::steady_clock::now();
++        rd_io_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t1 - rd_t0).count(), std::memory_order_relaxed);
++        rd_copy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(rd_t2 - rd_t1).count(), std::memory_order_relaxed);
++        rd_n_.fetch_add(n, std::memory_order_relaxed);
++    }
+     return true;
+ #else
+     (void) fills; (void) n;
+@@ -2499,12 +2783,48 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+ // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
+ // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
+ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+-    if (direct_.empty() || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
++    // unbuffered: one blob goes through copy_blob (copy_from_files reads it directly); prompt-only: copy_blob reads
++    // through the file cache, so every batch comes here
++    if (direct_.empty() ? pp_direct_.empty() : n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+     thread_local std::vector<Fill> fills;
+     fills.clear();
+     uint64_t bytes = 0;
++    // STRATA_STAGE_KEEP: the blobs the stage pool still holds (the decode's recent misses) are copied from RAM.  Each is
++    // marked busy while it is copied, as a fill would be, so claim_stage cannot hand the buffer out under the copy; a
++    // buffer still being filled is read from the drive instead
++    thread_local std::vector<size_t> held;   // per blob: its stage buffer, or SIZE_MAX
++    thread_local std::vector<const uint8_t*> from;   // that buffer's bytes (taken under the lock: the pool may grow)
++    held.assign(n, SIZE_MAX);
++    from.assign(n, nullptr);
++    if (stage_keep_ > 0) {
++        bool any = false;
++        {
++            std::lock_guard<std::mutex> lk(stage_mu_);
++            for (size_t i = 0; i < n; ++i) {
++                if (layers[i] < 0 || experts[i] < 0 || layers[i] >= n_layers_ || experts[i] >= n_expert_) continue;
++                const auto it = stage_of_.find((int64_t) layers[i] * n_expert_ + experts[i]);
++                if (it == stage_of_.end() || stage_busy_[it->second]) continue;
++                stage_busy_[it->second] = 1;
++                held[i] = it->second;
++                from[i] = stage_buf_[it->second].get();
++                any = true;
++            }
++        }
++        if (any) {
++            for (size_t i = 0; i < n; ++i)
++                if (held[i] != SIZE_MAX && dst[i] != nullptr)
++                    std::memcpy(dst[i], from[i], (size_t) layer_blob_bytes_[(size_t) layers[i]]);
++            {
++                std::lock_guard<std::mutex> lk(stage_mu_);
++                for (size_t i = 0; i < n; ++i)
++                    if (held[i] != SIZE_MAX) stage_busy_[held[i]] = 0;
++            }
++            stage_cv_.notify_all();
++        }
++    }
+     for (size_t i = 0; i < n; ++i) {
+         const int64_t l = layers[i], e = experts[i];
++        if (held[i] != SIZE_MAX) continue;
+         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
+         const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
+         if (complement_ready_ &&
+@@ -2680,9 +3000,38 @@ bool FileExpertSource::pin_cache_complement(
+                              (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
+             budget_bytes = clamped;
+         }
++        // STRATA_BUDGET_LEND_GIB=X: up to X GiB of the budget keep the prompt loan's experts (the tail slots, from the last
++        // one down - a short prompt lends only the last few), as the unbudgeted resident mode does.  A lent expert is then
++        // streamed during the prompt and put back after it from RAM instead of the drive (24 GB setup, R9700: 6.5 GiB at
++        // a 16K prompt, 12.5 GiB at 32K, read back at 3.5 GB/s).  The rest of the budget: the complement by rank, as
++        // before.  Off (0) by default: it is RAM the decode windows' misses no longer find there.
++        static const double lend_gib = [] { const char* v = std::getenv("STRATA_BUDGET_LEND_GIB"); return v ? std::atof(v) : 0.0; }();
++        const uint64_t lend_cap = lend_gib > 0.0 ? std::min<uint64_t>((uint64_t) (lend_gib * 1073741824.0), budget_bytes) : 0;
++        std::vector<char> lent_pick;
++        if (lend_cap > 0 && lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty()) {
++            const int64_t kf = detail::choose_resident_keep_from(slot_bytes, 0, lend_cap, lend_from_slot);
++            if (kf >= 0 && kf < n_slots) {
++                std::vector<std::pair<int32_t, int32_t>> core;
++                core.reserve(primary_gpu_pairs.size());
++                lent_pick.assign(offsets.size(), 0);
++                for (size_t i = 0; i < primary_gpu_pairs.size(); ++i) {
++                    if (pair_slot[i] < kf) core.push_back(primary_gpu_pairs[i]);
++                    else lent_pick[(size_t) primary_gpu_pairs[i].first * (size_t) n_expert_ + (size_t) primary_gpu_pairs[i].second] = 1;
++                }
++                if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
++                                                        additional_gpu_pairs, offsets, bytes, err)) return false;
++                budget_lend_keep_from_ = kf;
++            }
++        }
+         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
+         uint64_t at = 0;
+         int64_t held = 0;
++        for (size_t i = 0; i < lent_pick.size(); ++i)   // the loan's experts first
++            if (lent_pick[i] && offsets[i] != kNoComplement) {
++                ranked[i] = at;
++                at += layer_blob_bytes_[i / (size_t) n_expert_];
++                ++held;
++            }
+         if (rank != nullptr)
+             for (const auto& pr : *rank) {
+                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
+@@ -2703,7 +3052,10 @@ bool FileExpertSource::pin_cache_complement(
+                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
+         offsets.swap(ranked);
+         bytes = at;
+-        lend_from_slot = -1;
++        if (budget_lend_keep_from_ < 0) lend_from_slot = -1;
++        else
++            std::fprintf(stderr, "FileExpertSource: STRATA_BUDGET_LEND_GIB %.1f: the last %lld slots' experts (the prompt loan's) "
++                                 "kept in RAM first\n", lend_gib, (long long) (n_slots - budget_lend_keep_from_));
+     }
+ 
+     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+@@ -2741,7 +3093,9 @@ bool FileExpertSource::pin_cache_complement(
+     // their slots after it, so the ones that fit are kept here too (from the last slot down: a short prompt lends
+     // only the last few).  The rest keep the mapped-file fallback.
+     int64_t keep_from = n_slots;
+-    if (lend) {
++    if (lend && budget_lend_keep_from_ >= 0) {
++        keep_from = budget_lend_keep_from_;   // the budget branch already planned the loan's share (STRATA_BUDGET_LEND_GIB)
++    } else if (lend) {
+         keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+         if (keep_from < 0) keep_from = n_slots;
+         if (keep_from < n_slots) {
+@@ -3403,6 +3757,34 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
+     return blob(layer, expert);
+ }
+ 
++thread_local const float* g_pool_weights = nullptr;
++
++bool FileExpertSource::has_blob(int64_t layer, int64_t expert) {
++    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return true;
++    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    if (complement_ready_ && resident_blob(index) != nullptr) return true;
++    if (!override_.empty() && override_[index] != nullptr) return true;
++    if (!staged()) return true;
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    return stage_of_.find(layer * n_expert_ + expert) != stage_of_.end();   // staged, or being read
++}
++
++const uint8_t* FileExpertSource::blob_if_ready(int64_t layer, int64_t expert) {
++    // only a staged blob can be "not here yet"; every other kind of hand-out is what blob() does
++    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_ || complement_ready_ ||
++        !staged() || (io_pf_ && role_ptr_.empty() && direct_.empty()))
++        return blob(layer, expert);
++    const int64_t key = layer * n_expert_ + expert;
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    const auto it = stage_of_.find(key);
++    if (it == stage_of_.end() || stage_busy_[it->second]) return nullptr;   // still being read: the caller asks blob() later
++    size_t v = 0;
++    bool fill = false;
++    (void) claim_stage(key, v, fill);   // as staged_blob: refreshes its age, so the pointer holds for this layer
++    hand_hit_.fetch_add(1, std::memory_order_relaxed);
++    return stage_buf_[v].get();
++}
++
+ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
+     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+@@ -3822,6 +4204,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
+     static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
++    // STRATA_EXPERT_SKIP=W: a CPU expert no tier holds (nor is reading) whose weight is below W for every token routed
++    // to it here is skipped (kind -3: its rows are zero, nothing is read) - changes the output, opt-in
++    static const float skip_w = [] { const char* v = std::getenv("STRATA_EXPERT_SKIP"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
++    if (skip_w > 0.0f && g_pool_weights != nullptr) {
++        const float* w = g_pool_weights;
++        for (int64_t i = 0; i < n; ++i) {
++            if (kind[i] != -1 || ids[i] < 0 || ids[i] >= d.n_expert) continue;
++            bool first = true, light = true;
++            for (int64_t j = 0; j < n && light; ++j)
++                if (ids[j] == ids[i] && kind[j] < 0) {
++                    if (j < i) first = false;
++                    if (w[j] >= skip_w) light = false;
++                }
++            if (!first || !light || d.src->has_blob(d.layers, ids[i])) continue;
++            for (int64_t j = i; j < n; ++j)
++                if (ids[j] == ids[i] && kind[j] == -1) { kind[j] = -3; ++d.skipped; }
++        }
++    }
+     bool any_cpu = false;
+     for (int64_t i = 0; i < n; ++i)
+         if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
+@@ -3850,6 +4250,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+     }
+     int njobs = 0;
++    // STRATA_POOL_EARLY=1: the experts whose blobs are here are computed first, while the rest are still being read
++    static const bool early = [] { const char* v = std::getenv("STRATA_POOL_EARLY"); return v != nullptr && std::atoi(v) != 0; }();
++    static thread_local std::vector<int64_t> later;   // entries whose blob was not here yet
++    later.clear();
+     for (int64_t t = 0; t < n_tok; ++t)
+         for (int64_t j = 0; j < k; ++j) {
+             const int64_t i = t * k + j;
+@@ -3867,6 +4271,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+                 ++d.tail_skipped;
+                 continue;
+             }
++            if (kind[i] == -3) {            // STRATA_EXPERT_SKIP: left out, its row adds nothing
++                std::memset(row, 0, (size_t) H * sizeof(float));
++                continue;
++            }
+             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
+                 if (kind[i] == 0) ++d.cache_hits;
+                 else ++d.offload_entries;                       // #588: PCIe or another GPU
+@@ -3880,8 +4288,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+             }
+             ++d.cache_refused;
+             int16_t& jo = d.job_of[(size_t) e];
++            if (jo == -2) {   // STRATA_POOL_EARLY: this expert waits for the second pass, with all its entries
++                later.push_back(i);
++                continue;
++            }
+             if (jo < 0) {
+-                const uint8_t* b = d.src->blob(d.layers, e);
++                const uint8_t* b = early ? d.src->blob_if_ready(d.layers, e) : d.src->blob(d.layers, e);
++                if (b == nullptr && early) {
++                    jo = -2;
++                    later.push_back(i);
++                    continue;
++                }
+                 if (b == nullptr) {
+                     d.failed = true;
+                     d.fail = "the expert source could not produce a blob";
+@@ -3904,9 +4321,42 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
+         }
+     const auto c3 = std::chrono::steady_clock::now();
+     pt("run", njobs);
+-    if (njobs > 0) {
+-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
++    auto run_jobs = [&](int from, int to) {
++        if (to <= from) return;
++        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data() + from, to - from);
++        else d.pool->run_split_multi(d.jobs_multi.data() + from, to - from);
++    };
++    if (later.empty()) {
++        run_jobs(0, njobs);
++    } else {   // STRATA_POOL_EARLY: what is here, then the rest as it lands
++        const int ready = njobs;
++        run_jobs(0, ready);
++        for (const int64_t i : later) {
++            const int64_t t = i / k, e = ids[i];
++            int16_t& jo = d.job_of[(size_t) e];
++            if (jo < 0) {   // -2: deferred in the first pass
++                const uint8_t* b = d.src->blob(d.layers, e);
++                if (b == nullptr) {
++                    d.failed = true;
++                    d.fail = "the expert source could not produce a blob";
++                    d.fail_layer = d.layers;
++                    d.fail_expert = e;
++                    ++d.missing;
++                    return;
++                }
++                jo = (int16_t) njobs++;
++                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
++                nj.blob = b;
++                nj.nt = 0;
++            }
++            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
++            jb.act[jb.nt] = &d.act_multi[(size_t) t];
++            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
++            jb.out[jb.nt] = out + (size_t) i * H;
++            ++jb.nt;
++            ++d.multi_entries;
++        }
++        run_jobs(ready, njobs);
+     }
+     if (d.remote_count > 0) {
+         static thread_local std::string remote_error;
+@@ -4597,6 +5047,16 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
+         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
+         return false;
+     }
++    // STRATA_ARENA_MLOCK=1 (Linux): lock the filled arena.  Registered for the GPU it is a KFD userptr, which the kernel
++    // may still MOVE (compaction for another process's large allocation); every move suspends the GPU's queues until
++    // the driver maps the range again (R9700: 2-17 s per run of prompts, 40-70 s at load).  Locked pages are left where
++    // they are when vm.compact_unevictable_allowed = 0.  Needs the memlock limit (ulimit -l / LimitMEMLOCK) for it.
++    if (const char* ml = std::getenv("STRATA_ARENA_MLOCK"); ml != nullptr && ml[0] == '1') {
++        const strata::platform::LockResult lr = strata::platform::lock_resident(a->data(), want + (uint64_t) blob);
++        std::fprintf(stderr, "strata generate: STRATA_ARENA_MLOCK: %s, %.1f GiB%s\n", lr.note.c_str(),
++                     (double) (want + (uint64_t) blob) / 1073741824.0,
++                     lr.ok ? "" : " - not locked: the kernel may move the arena's pages (see vm.compact_unevictable_allowed)");
++    }
+     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
+         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
+                      (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index df61724f..734a7a04 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2,6 +2,7 @@
+ #include "strata/core/batch_rows.hpp"
+ #include "strata/kernels/gfx_arch.hpp"
+ #include "strata/core/verify.hpp"
++#include "strata/core/expert_source.hpp"
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/dma_batch.hpp"
+ #include "strata/core/spec_prob.hpp"
+@@ -2240,6 +2241,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+         progress_at("verify window: the CPU experts of layer", l);
+         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr)
+             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+@@ -2911,6 +2913,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
+         // The recorded graph consumes the helper mask and weighted sum just as
+         // the solo graph does. Reset both and supply this layer's routing weights.
+         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+         if (remote_opt_) remote_opt_->end();
+         progress_tick();
+@@ -3066,6 +3069,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+         cur_layer_ = want - 1;
+         set_plan_slot(0);
+         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+         if (remote_opt_) remote_opt_->end();
+         progress_tick();
+@@ -3344,6 +3348,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+         set_plan_slot(grp);
+         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+         progress_at("verify window (pipelined): the CPU experts of layer", l);
++        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
+         if (pool != nullptr)
+             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index 88ecb793..ea591d93 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -374,7 +374,152 @@ bool prompt_f16() {
+ #endif
+ }
+ 
++#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
++// ---- STRATA_PF_FP8: native() as an FP8 product (see Gemm::native_fp8)
++}  // namespace strata::prefill
++#include <hip/hip_fp8.h>
++#include <map>
++namespace strata::prefill {
++namespace {
++constexpr float kE4M3Max = 448.0f;
++__device__ __forceinline__ uint8_t to_e4m3(float v) {
++    return (uint8_t) __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
++}
++__device__ __forceinline__ float block_max256(float m) {
++    __shared__ float red[256];
++    red[threadIdx.x] = m;
++    __syncthreads();
++    for (int o = 128; o > 0; o >>= 1) {
++        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
++        __syncthreads();
++    }
++    return red[0];
++}
++// one block per weight row: scale = max |w| / 448, the row in E4M3 at that scale
++__global__ void __launch_bounds__(256) fp8_rows_kernel(const uint16_t* __restrict__ w16, int64_t K, uint8_t* __restrict__ w8,
++                                                       float* __restrict__ scale) {
++    const int64_t r = blockIdx.x;
++    const __half* row = reinterpret_cast<const __half*>(w16) + r * K;
++    float m = 0.0f;
++    for (int64_t i = threadIdx.x; i < K; i += 256) m = fmaxf(m, fabsf(__half2float(row[i])));
++    m = block_max256(m);
++    const float sc = m > 0.0f ? m / kE4M3Max : 1.0f, inv = 1.0f / sc;
++    for (int64_t i = threadIdx.x; i < K; i += 256) w8[r * K + i] = to_e4m3(__half2float(row[i]) * inv);
++    if (threadIdx.x == 0) scale[r] = sc;
++}
++// the largest |x| of n FP16 values into *amax (float bits: non-negative floats order as unsigned ints)
++__global__ void __launch_bounds__(256) fp8_amax_kernel(const uint16_t* __restrict__ x16, int64_t n, uint32_t* __restrict__ amax) {
++    const __half* x = reinterpret_cast<const __half*>(x16);
++    float m = 0.0f;
++    for (int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x; i < n; i += (int64_t) gridDim.x * 256)
++        m = fmaxf(m, fabsf(__half2float(x[i])));
++    m = block_max256(m);
++    if (threadIdx.x == 0 && m > 0.0f) atomicMax(amax, __float_as_uint(m));
++}
++__global__ void __launch_bounds__(256) fp8_act_kernel(const uint16_t* __restrict__ x16, int64_t n, const uint32_t* __restrict__ amax,
++                                                      uint8_t* __restrict__ x8) {
++    const __half* x = reinterpret_cast<const __half*>(x16);
++    const float m = __uint_as_float(*amax), inv = m > 0.0f ? kE4M3Max / m : 1.0f;
++    for (int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x; i < n; i += (int64_t) gridDim.x * 256)
++        x8[i] = to_e4m3(__half2float(x[i]) * inv);
++}
++__global__ void fp8_alpha_kernel(const float* __restrict__ wscale, int64_t N, const uint32_t* __restrict__ amax,
++                                 float* __restrict__ alpha) {
++    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
++    const float m = __uint_as_float(*amax), xs = m > 0.0f ? m / kE4M3Max : 1.0f;
++    if (i < N) alpha[i] = wscale[i] * xs;
++}
++struct Fp8Key {
++    int t, n, k, ldy;
++    uint32_t beta_bits;
++    bool operator<(const Fp8Key& o) const { return std::tie(t, n, k, ldy, beta_bits) < std::tie(o.t, o.n, o.k, o.ldy, o.beta_bits); }
++};
++// the algorithm is chosen once per bucket of rows (the slice rounded up to 1024) and per (n, k, ldy, beta): asking
++// hipBLASLt for every request's own row count loaded a new solution's code on most requests (1.6-3.0K tok/s spread)
++struct Fp8Algo {
++    bool ok = false;
++    hipblasLtMatmulAlgo_t algo{};
++};
++struct Fp8Plan {
++    bool ok = false;
++    hipblasLtMatmulDesc_t op = nullptr;
++    hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
++    hipblasLtMatmulAlgo_t algo{};
++};
++struct Fp8Cache {
++    std::map<Fp8Key, Fp8Plan> plans;
++    std::map<Fp8Key, Fp8Algo> algos;   // t = the bucket
++    ~Fp8Cache() {
++        for (auto& [k, p] : plans) {
++            if (p.op) hipblasLtMatmulDescDestroy(p.op);
++            if (p.a) hipblasLtMatrixLayoutDestroy(p.a);
++            if (p.b) hipblasLtMatrixLayoutDestroy(p.b);
++            if (p.c) hipblasLtMatrixLayoutDestroy(p.c);
++        }
++    }
++};
++// the descriptors and hipBLASLt's first heuristic answer for one shape (Y[t, n] fp32 = X8[t, k] . W8[n, k]^T, alpha
++// per row of W, beta on the host)
++const Fp8Plan& fp8_plan(Fp8Cache& cache, HipLtState& st, int t, int n, int k, int ldy, float beta) {
++    uint32_t bb = 0;
++    std::memcpy(&bb, &beta, sizeof bb);
++    Fp8Plan& p = cache.plans[Fp8Key{t, n, k, ldy, bb}];
++    if (p.op != nullptr) return p;
++    const hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
++    const hipblasLtPointerMode_t pm = HIPBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST;
++    if (hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_POINTER_MODE, &pm, sizeof pm) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatrixLayoutCreate(&p.a, HIP_R_8F_E4M3, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatrixLayoutCreate(&p.b, HIP_R_8F_E4M3, k, t, k) != HIPBLAS_STATUS_SUCCESS ||
++        hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, n, t, ldy) != HIPBLAS_STATUS_SUCCESS)
++        return p;
++    const int bucket = (t + 1023) / 1024 * 1024;
++    Fp8Algo& fa = cache.algos[Fp8Key{bucket, n, k, ldy, bb}];
++    if (!fa.ok) {
++        // asked at the bucket's own size (layouts of `bucket` columns), then checked for this t below
++        hipblasLtMatrixLayout_t bb_l = nullptr, bc_l = nullptr;
++        hipblasLtMatmulPreference_t pref = nullptr;
++        hipblasLtMatmulHeuristicResult_t res[4];
++        int got = 0;
++        const uint64_t ws = st.workspace_bytes;
++        if (hipblasLtMatrixLayoutCreate(&bb_l, HIP_R_8F_E4M3, k, bucket, k) == HIPBLAS_STATUS_SUCCESS &&
++            hipblasLtMatrixLayoutCreate(&bc_l, HIP_R_32F, n, bucket, std::max(ldy, n)) == HIPBLAS_STATUS_SUCCESS &&
++            hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
++            hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof ws) == HIPBLAS_STATUS_SUCCESS &&
++            hipblasLtMatmulAlgoGetHeuristic(st.handle, p.op, p.a, bb_l, bc_l, bc_l, pref, 4, res, &got) == HIPBLAS_STATUS_SUCCESS && got > 0) {
++            fa.algo = res[0].algo;
++            fa.ok = true;
++        }
++        if (pref) hipblasLtMatmulPreferenceDestroy(pref);
++        if (bb_l) hipblasLtMatrixLayoutDestroy(bb_l);
++        if (bc_l) hipblasLtMatrixLayoutDestroy(bc_l);
++    }
++    if (fa.ok) {
++        size_t need = 0;
++        const float one = 1.0f;
++        hipblasLtMatmulAlgo_t algo = fa.algo;
++        if (hipblaslt_ext::matmulIsAlgoSupported(st.handle, p.op, &one, p.a, p.b, &beta, p.c, p.c, algo, need) ==
++                HIPBLAS_STATUS_SUCCESS && need <= st.workspace_bytes) {
++            p.algo = algo;
++            p.ok = true;
++        }
++    }
++    if (!p.ok)
++        std::fprintf(stderr, "prefill gemm: no FP8 hipBLASLt solution for t %d n %d k %d (the FP16 path takes it)\n", t, n, k);
++    return p;
++}
++}  // namespace
++#endif
++
+ Gemm::~Gemm() {
++#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
++    delete static_cast<Fp8Cache*>(fp8_cache_);
++    if (fp8_w_) cudaFree(fp8_w_);
++    if (fp8_vec_) cudaFree(fp8_vec_);
++    if (fp8_amax_) cudaFree(fp8_amax_);
++#endif
+ #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
+     if (mmq_buf_) cudaFree(mmq_buf_);
+@@ -816,6 +961,79 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
+ #endif
+ }
+ 
++// STRATA_PF_FP8=1: the dense product of a native (quantized) weight as FP8 E4M3 on both sides - the weight, dequantized to
++// FP16 as before, scaled per row to E4M3's range; the activations per slice of rows by their largest |x|; hipBLASLt's
++// alpha vector (row scale x activation scale) puts the product back on the FP32 scale it had.  Chunks of at least
++// STRATA_PF_FP8_MIN_T rows (default 1024); the numbers differ from the FP16 path (E4M3 keeps 3 mantissa bits).
++bool Gemm::native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
++                      int64_t ldy, float beta) {
++#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
++    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FP8"); return v && v[0] == '1'; }();
++    static const int64_t min_t = [] { const char* v = std::getenv("STRATA_PF_FP8_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 1024; }();
++    auto* st = static_cast<HipLtState*>(hipblaslt_state_);
++    if (!on || fp8_failed_ || st == nullptr || T < min_t || N * K > scratch_elems_ || K % 16 != 0 || N > INT_MAX ||
++        K > INT_MAX)
++        return false;
++    if (ldy <= 0) ldy = N;
++    const cudaStream_t s = (cudaStream_t) stream_;
++    if (fp8_w_bytes_ < N * K) {
++        if (fp8_w_) cudaFree(fp8_w_);
++        fp8_w_ = nullptr;
++        fp8_w_bytes_ = 0;
++        if (cudaMalloc((void**) &fp8_w_, (size_t) (N * K)) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
++        fp8_w_bytes_ = N * K;
++    }
++    if (fp8_vec_rows_ < N) {
++        if (fp8_vec_) cudaFree(fp8_vec_);
++        fp8_vec_ = nullptr;
++        fp8_vec_rows_ = 0;
++        if (cudaMalloc((void**) &fp8_vec_, (size_t) (2 * N) * sizeof(float)) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
++        fp8_vec_rows_ = N;
++    }
++    if (fp8_amax_ == nullptr && cudaMalloc((void**) &fp8_amax_, 256) != cudaSuccess) { (void) cudaGetLastError(); fp8_failed_ = true; return false; }
++    if (fp8_cache_ == nullptr) {
++        fp8_cache_ = new Fp8Cache();
++        std::fprintf(stderr, "prefill gemm: FP8 dense products on (STRATA_PF_FP8=1, chunks of %lld+ rows)\n", (long long) min_t);
++    }
++    auto& cache = *static_cast<Fp8Cache*>(fp8_cache_);
++    // the activations' slices go through the scratch once the weight has left it: rows of K bytes
++    const int64_t R = std::min<int64_t>(T, (scratch_elems_ * 2) / K);
++    for (int64_t r0 = 0; r0 < T; r0 += R) {   // every slice's shape must have a plan before anything is launched
++        const int64_t rows = std::min(R, T - r0);
++        if (rows > INT_MAX || !fp8_plan(cache, *st, (int) rows, (int) N, (int) K, (int) ldy, beta).ok) return false;
++    }
++    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
++    float* wscale = fp8_vec_;
++    float* alpha = fp8_vec_ + N;
++    fp8_rows_kernel<<<(unsigned) N, 256, 0, s>>>(scratch_, K, fp8_w_, wscale);
++    uint8_t* x8 = reinterpret_cast<uint8_t*>(scratch_);
++    for (int64_t r0 = 0; r0 < T; r0 += R) {
++        const int64_t rows = std::min(R, T - r0), n = rows * K;
++        const unsigned g = (unsigned) std::min<int64_t>((n + 255) / 256, 4096);
++        cudaMemsetAsync(fp8_amax_, 0, 4, s);
++        fp8_amax_kernel<<<g, 256, 0, s>>>(X + r0 * K, n, fp8_amax_);
++        fp8_act_kernel<<<g, 256, 0, s>>>(X + r0 * K, n, fp8_amax_, x8);
++        fp8_alpha_kernel<<<(unsigned) ((N + 255) / 256), 256, 0, s>>>(wscale, N, fp8_amax_, alpha);
++        const Fp8Plan& p = fp8_plan(cache, *st, (int) rows, (int) N, (int) K, (int) ldy, beta);
++        const hipblasStatus_t rs = hipblasLtMatmul(st->handle, p.op, alpha, fp8_w_, p.a, x8, p.b, &beta, Y + r0 * ldy, p.c,
++                                                   Y + r0 * ldy, p.c, &p.algo, st->workspace, st->workspace_bytes, s);
++        if (rs != HIPBLAS_STATUS_SUCCESS) {
++            std::fprintf(stderr, "prefill gemm: the FP8 product failed (status %d, t %lld n %lld k %lld)\n", (int) rs,
++                         (long long) rows, (long long) N, (long long) K);
++            std::exit(1);   // part of Y may be written: no silent fallback
++        }
++    }
++    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
++        std::fprintf(stderr, "prefill gemm: native_fp8: %s\n", cudaGetErrorString(e));
++        std::exit(1);
++    }
++    return true;
++#else
++    (void) X; (void) ggml_type; (void) W_blocks; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta;
++    return false;
++#endif
++}
++
+ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                   int64_t ldy, float beta, int64_t ldx) {
+ #ifdef STRATA_USE_HIP
+@@ -854,6 +1072,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
+ #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+ #endif
++    if ((ldx == 0 || ldx == K) && native_fp8(X, ggml_type, W_blocks, Y, T, N, K, ldy, beta)) return;
+     if (N * K > scratch_elems_) {
+         // Too large for the scratch at once: in row slices.
+         const int64_t rows = scratch_elems_ / K;
+diff --git a/src/prefill/kernels.cu b/src/prefill/kernels.cu
+index 18ec999a..6e96cb28 100644
+--- a/src/prefill/kernels.cu
++++ b/src/prefill/kernels.cu
+@@ -2162,6 +2162,36 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
+     peer_scatter_add_kernel<<<blocks_for(n * N), 256, 0, (cudaStream_t) stream>>>(sum, rows, wk, pair, n);
+     check("peer_scatter_add");
+ }
++// STRATA_PF_DM16: moe_combine4_kernel with the down rows in BF16 (four columns per thread, 8 bytes a slot)
++__global__ void moe_combine4_bf16_kernel(const uint16_t* __restrict__ Dm, const int32_t* __restrict__ slot,
++                                         const float* __restrict__ w, const float4* __restrict__ shared,
++                                         const float* __restrict__ sg, float4* __restrict__ bo, int64_t T) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= T * (N / 4)) return;
++    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
++    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    uint2 v[10];
++    float ww[10];
++#pragma unroll
++    for (int k = 0; k < 10; ++k) {
++        ww[k] = w[t * 10 + k];
++        v[k] = *reinterpret_cast<const uint2*>(Dm + (int64_t) slot[t * 10 + k] * N + d);
++    }
++#pragma unroll
++    for (int k = 0; k < 10; ++k) {
++        s.x = fmaf(ww[k], __uint_as_float(v[k].x << 16), s.x); s.y = fmaf(ww[k], __uint_as_float(v[k].x & 0xFFFF0000u), s.y);
++        s.z = fmaf(ww[k], __uint_as_float(v[k].y << 16), s.z); s.w = fmaf(ww[k], __uint_as_float(v[k].y & 0xFFFF0000u), s.w);
++    }
++    const float g = sigm(sg[t]);
++    const float4 sh = shared[i];
++    bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
++}
++void moe_combine_bf16(const void* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
++                      int64_t T, void* stream) {
++    moe_combine4_bf16_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
++        (const uint16_t*) Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T);
++    check("moe_combine_bf16");
++}
+ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                  int64_t T, void* stream) {
+ #ifndef STRATA_W_NO_COMB
+diff --git a/src/prefill/moe_fused_iq.cu b/src/prefill/moe_fused_iq.cu
+index c28a0fb3..89e93304 100644
+--- a/src/prefill/moe_fused_iq.cu
++++ b/src/prefill/moe_fused_iq.cu
+@@ -716,7 +716,14 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
+ 
+ // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
+ // Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
+-template <int WT, bool GU, bool ALIAS = false, int LB = 0>
++__device__ __forceinline__ uint32_t bf16x2_rn(float a, float b) {   // round to nearest even, a in the low half
++    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
++    ua += 0x7FFFu + ((ua >> 16) & 1u);
++    ub += 0x7FFFu + ((ub >> 16) & 1u);
++    return (ua >> 16) | (ub & 0xFFFF0000u);
++}
++// D16 (STRATA_PF_DM16=1, gfx12): the down rows are stored as BF16 (moe_combine_bf16 reads them), half the bytes
++template <int WT, bool GU, bool ALIAS = false, int LB = 0, bool D16 = false>
+ __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
+ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
+                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
+@@ -938,9 +945,16 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
+                         if (r < nrows) {
+ #if STRATA_NAT_W12
+                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
+-                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + 8 * hi);
+-                            d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
+-                            d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
++                            if constexpr (D16) {
++                                uint4* d = reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + r) * 2560 + rbase +
++                                                                    32 * wm + 16 * mt + 8 * hi);
++                                *d = make_uint4(bf16x2_rn(acc[mt][nt][0], acc[mt][nt][1]), bf16x2_rn(acc[mt][nt][2], acc[mt][nt][3]),
++                                                bf16x2_rn(acc[mt][nt][4], acc[mt][nt][5]), bf16x2_rn(acc[mt][nt][6], acc[mt][nt][7]));
++                            } else {
++                                float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + 8 * hi);
++                                d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
++                                d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
++                            }
+ #else
+                             float* d = dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
+ #pragma unroll
+@@ -955,6 +969,415 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
+     __builtin_trap();
+ #endif
+ }
++
++// ---- STRATA_PF_FUSED_F8=1 (gfx12): the gate/up product on the FP8 matrix cores, v_wmma_f32_16x16x16_fp8_fp8.  A weight is
++// decoded as for native_w11_kernel (int8 code q and its scale per 16 / 32 values), then stored as E4M3 at one scale for the
++// whole row (the row's largest block d x f8_bound, / 448: no value can pass E4M3's 448); the activations are E4M3 at one scale
++// per token (quant_act_f8_kernel).  The products accumulate in FP32 inside the WMMA - no per-block scaling between them - and
++// the two scales multiply once, before the SwiGLU.  H leaves as int8 per 32 values, as before (the down kernel is unchanged).
++// The numbers differ from the int8 path's: E4M3 keeps 3 mantissa bits of each weight and activation.
++#if STRATA_NAT_W12
++typedef float nw_f8 __attribute__((ext_vector_type(8)));
++__device__ __forceinline__ nw_f8 nw_wmma_f8(nw_ab a, nw_ab b, nw_f8 c) {
++    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
++}
++#endif
++// the largest |w| of a block, per unit of its d: the largest scale multiplier x the largest code
++template <int T> __host__ __device__ constexpr float f8_bound() {
++    return (T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S) ? 3.875f * 43.0f : T == T_IQ3_XXS ? 7.75f * 62.0f
++         : T == T_IQ3_S ? 31.0f * 15.0f : 32.0f * 127.0f;   // IQ4_XS: |ls - 32| <= 32, |kvalue| <= 127
++}
++__host__ __device__ constexpr bool f8_gu_type(int t) {
++    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
++}
++
++// H8: H leaves as E4M3 per 64 features at one scale (the float at byte 64 of its 80) - native_w12f8_d_kernel's input
++template <int WT, bool ALIAS, int LB, bool H8 = false>
++__global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
++native_w12f8_gu_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
++                       const int32_t* __restrict__ src, uint8_t* __restrict__ out) {
++#if STRATA_NAT_W12
++    constexpr int NS = GU_ROWS_K / 64;
++    constexpr int NFB = 1280 / NW_ROWS;
++    constexpr int ACT_LD = NS * AB;
++    constexpr int BS = block_bytes(WT);
++    constexpr int NB = GU_ROWS_K / 256;   // the row's 256-value blocks
++    constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
++    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
++    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
++    __shared__ float rsc[NW_ROWS];                                // the rows' scales
++    __shared__ __align__(16) uint8_t sgrid[GB];
++    constexpr int SGN = (WT == T_IQ2_XXS || WT == T_IQ2_XS || WT == T_IQ2_S || WT == T_IQ3_XXS || WT == T_IQ3_S)
++                            ? sign_entries(WT) : 1;
++    __shared__ __align__(16) uint4 ssign[SGN];
++    __shared__ int srow[kTileRows];
++    __shared__ float hs_sep[ALIAS ? 1 : kTileRows][65];
++    static_assert(!ALIAS || (size_t) kTileRows * 65 * 4 <= (size_t) 2 * NW_ROWS * WLD, "H tile must fit the weight buffers");
++    float(*hs)[65] = ALIAS ? reinterpret_cast<float(*)[65]>(wtbuf) : hs_sep;
++    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
++    const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
++    (void) lane;
++    if constexpr (grid_bytes(WT) > 0) {
++        const uint32_t* gs = (const uint32_t*) grid_src<WT>();
++        for (int i = tid; i < grid_bytes(WT) / 4; i += NW_THREADS) ((uint32_t*) sgrid)[i] = gs[i];
++    }
++    if constexpr (SGN > 1) {
++        for (int i = tid; i < SGN; i += NW_THREADS) ssign[i] = sign_entry(i, SGN == 128);
++    }
++    uint32_t kv[4] = {0, 0, 0, 0};
++    if constexpr (WT == T_IQ4_XS) {
++#pragma unroll
++        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
++    }
++    const int ur = tid >> 1, uj = tid & 1;
++    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
++    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
++        const int2 tl = tb.tiles[t0 + w / NFB];
++        const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
++        const uint8_t* blob = b.blob[e - b.e0];
++        const uint8_t* wrow = blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row;
++        auto unit = [&](int s) -> const uint8_t* { return wrow + (s >> 2) * BS; };
++        auto sub = [&](int s) { return 2 * (s & 3) + uj; };
++        float dm = 0.0f;
++#pragma unroll
++        for (int k = 0; k < NB; ++k) dm = fmaxf(dm, fabsf(half_at(ld16(wrow + k * BS))));
++        const float rs = dm > 0.0f ? dm * (f8_bound<WT>() / 448.0f) : 1.0f, inv = 1.0f / rs;
++        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
++            uint32_t q[8];
++            float s0, s1;
++            convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
++            const float f0 = s0 * inv, f1 = s1 * inv;
++            uint32_t o[8];
++#pragma unroll
++            for (int k = 0; k < 8; ++k) {   // signed byte c: (c + 128) as an unsigned byte, times f, minus 128 f
++                const float f = k < 4 ? f0 : f1, nf = -128.0f * f;
++                const uint32_t u = q[k] ^ 0x80808080u;
++                const float v0 = fmaf((float) (u & 255u), f, nf), v1 = fmaf((float) ((u >> 8) & 255u), f, nf);
++                const float v2 = fmaf((float) ((u >> 16) & 255u), f, nf), v3 = fmaf((float) (u >> 24), f, nf);
++                int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0, false);
++                pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
++                o[k] = (uint32_t) pk;
++            }
++            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
++            d[0] = make_uint4(o[0], o[1], o[2], o[3]);
++            d[1] = make_uint4(o[4], o[5], o[6], o[7]);
++        };
++        __syncthreads();                                          // the previous item is done with the buffers
++        if (tid < kTileRows) srow[tid] = src[row0 + min(tid, nrows - 1)];
++        if (uj == 0) rsc[ur] = rs;
++        uint32_t raw[raw_words(WT)] = {};
++        load_unit<WT>(unit(0), sub(0), raw);
++        put(raw, 0);
++        if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
++        __syncthreads();                                          // srow, rsc
++        const bool on = 32 * wn < nrows;
++        const uint8_t* brow[2];
++#pragma unroll
++        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
++        nw_f8 acc[2][2];
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) acc[mt][nt] = nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++        nw_frag bq[2][4];
++        auto fetch_b = [&](int s, nw_frag (&q)[2][4]) {
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) {
++                const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);
++                q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
++            }
++        };
++        if (on) fetch_b(0, bq);
++        for (int s = 0; s < NS; ++s) {
++            __syncthreads();                                      // stage s's weights are in buffer s & 1
++            nw_frag nbq[2][4];
++            if (on && s + 1 < NS) fetch_b(s + 1, nbq);
++            if (on) {
++                const int bf = s & 1;
++#pragma unroll
++                for (int h = 0; h < 2; ++h) {
++#pragma unroll
++                    for (int mt = 0; mt < 2; ++mt) {
++                        const int rb = 32 * wm + 16 * mt;
++                        const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
++                        const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
++#pragma unroll
++                        for (int nt = 0; nt < 2; ++nt)
++                            acc[mt][nt] = nw_wmma_f8(A1, nw_v(bq[nt][2 * h + 1]), nw_wmma_f8(A0, nw_v(bq[nt][2 * h]), acc[mt][nt]));
++                    }
++                }
++            }
++            if (s + 1 < NS) {
++                put(raw, (s + 1) & 1);
++                __syncthreads();
++                if (s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
++                if (on) {
++#pragma unroll
++                    for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
++                }
++            }
++        }
++        if constexpr (ALIAS) __syncthreads();                     // every wave is done reading the weight buffers
++        if (on) {
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) {
++                const float ts = *reinterpret_cast<const float*>(brow[nt] + 64);   // the token's activation scale
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt) {
++                    const int rb = 32 * wm + 16 * mt + 8 * hi;
++                    // lane l: local rows rb + i = features 16 wm + 8 mt + 4 hi + j, gate (i = 2j) and up (2j + 1)
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        const float gt = acc[mt][nt][2 * j] * (rsc[rb + 2 * j] * ts);
++                        const float up = acc[mt][nt][2 * j + 1] * (rsc[rb + 2 * j + 1] * ts);
++                        hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + 4 * hi + j] = gt / (1.0f + __expf(-gt)) * up;
++                    }
++                }
++            }
++        }
++        __syncthreads();
++        if constexpr (H8) {   // H block fb as E4M3: the pair of threads of a row share the 64 features' largest |h|
++            if (tid < 2 * kTileRows) {
++                const int r = tid >> 1, hh = tid & 1;
++                if (r < nrows) {
++                    float am = 0.0f;
++#pragma unroll 8
++                    for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
++                    am = fmaxf(am, __shfl_xor(am, 1));
++                    const float iv = am > 0.0f ? 448.0f / am : 0.0f;
++                    uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
++                    uint32_t wd[8];
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) {
++                        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(hs[r][32 * hh + 4 * j] * iv, hs[r][32 * hh + 4 * j + 1] * iv, 0, false);
++                        pk = __builtin_amdgcn_cvt_pk_fp8_f32(hs[r][32 * hh + 4 * j + 2] * iv, hs[r][32 * hh + 4 * j + 3] * iv, pk, true);
++                        wd[j] = (uint32_t) pk;
++                    }
++                    uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
++                    o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
++                    o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
++                    if (hh == 0) *reinterpret_cast<float*>(o + 64) = am / 448.0f;
++                }
++            }
++            continue;
++        }
++        // H block fb (features 64 fb ..) to int8 per 32, natural order (as native_w11_kernel)
++        if (tid < 2 * kTileRows) {
++            const int r = tid >> 1, hh = tid & 1;
++            if (r < nrows) {
++                float am = 0.0f;
++#pragma unroll 8
++                for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
++                const float iv = am > 0.0f ? 127.0f / am : 0.0f;
++                uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
++                uint32_t wd[8] = {};
++                int csum = 0;
++#pragma unroll
++                for (int j = 0; j < 32; ++j) {
++                    const int c = __float2int_rn(hs[r][32 * hh + j] * iv);
++                    csum += c;
++                    wd[j >> 2] |= (uint32_t) (uint8_t) (int8_t) c << (8 * (j & 3));
++                }
++                uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
++                o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
++                o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
++                *reinterpret_cast<float*>(o + 64 + 4 * hh) = am / 127.0f;
++                *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;
++            }
++        }
++    }
++#else
++    __builtin_trap();
++#endif
++}
++
++// STRATA_PF_FUSED_F8 down: H (E4M3 per 64 features, native_w12f8_gu_kernel<.., H8>) . W_down (decoded to E4M3 at one scale
++// per row: the largest block d x f8_bound_d / 448).  Per 64 values of K (one H block) the four WMMAs accumulate from 0 and
++// the block's H scale multiplies them in once; the row scale once at the end.  Down rows into `dm` (BF16 with D16).
++template <int T> __host__ __device__ constexpr float f8_bound_d() { return T == T_IQ4_NL ? 127.0f : 2.0f; }   // Q2_0: code - 1 <= 2
++__host__ __device__ constexpr bool f8_d_type(int t) { return t == T_IQ4_NL || t == T_Q2_0; }
++template <int WT, int LB, bool D16>
++__global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
++native_w12f8_d_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
++                      float* __restrict__ dm) {
++#if STRATA_NAT_W12
++    constexpr int NS = D_ROWS_K / 64;
++    constexpr int NFB = 2560 / NW_ROWS;
++    constexpr int ACT_LD = NS * AB;
++    constexpr int BS = block_bytes(WT);
++    constexpr int BV = WT == T_IQ4_NL ? 32 : 64;   // values per block
++    constexpr int NB = D_ROWS_K / BV;
++    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
++    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
++    __shared__ float rsc[NW_ROWS];
++    __shared__ int srow[kTileRows];
++    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
++    const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
++    (void) lane;
++    uint32_t kv[4] = {0, 0, 0, 0};
++    if constexpr (WT == T_IQ4_NL) {
++#pragma unroll
++        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
++    }
++    const int ur = tid >> 1, uj = tid & 1;
++    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
++    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
++        const int2 tl = tb.tiles[t0 + w / NFB];
++        const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
++        const uint8_t* blob = b.blob[e - b.e0];
++        const int rbase = fb * NW_ROWS;
++        const uint8_t* wrow = blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
++        auto unit = [&](int s) -> const uint8_t* { return WT == T_IQ4_NL ? wrow + (2 * s + uj) * BS : wrow + s * BS; };
++        float dmax = 0.0f;
++#pragma unroll
++        for (int k = 0; k < NB; ++k) dmax = fmaxf(dmax, fabsf(half_at(ld16(wrow + k * BS))));
++        const float rs = dmax > 0.0f ? dmax * (f8_bound_d<WT>() / 448.0f) : 1.0f, inv = 1.0f / rs;
++        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
++            uint32_t q[8];
++            float s0, s1;
++            convert<WT>(raw, nullptr, kv, q, s0, s1);
++            const float f0 = s0 * inv, f1 = s1 * inv;
++            uint32_t o[8];
++#pragma unroll
++            for (int k = 0; k < 8; ++k) {
++                const float f = k < 4 ? f0 : f1, nf = -128.0f * f;
++                const uint32_t u = q[k] ^ 0x80808080u;
++                const float v0 = fmaf((float) (u & 255u), f, nf), v1 = fmaf((float) ((u >> 8) & 255u), f, nf);
++                const float v2 = fmaf((float) ((u >> 16) & 255u), f, nf), v3 = fmaf((float) (u >> 24), f, nf);
++                int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0, false);
++                pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
++                o[k] = (uint32_t) pk;
++            }
++            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
++            d[0] = make_uint4(o[0], o[1], o[2], o[3]);
++            d[1] = make_uint4(o[4], o[5], o[6], o[7]);
++        };
++        __syncthreads();
++        if (tid < kTileRows) srow[tid] = row0 + min(tid, nrows - 1);
++        if (uj == 0) rsc[ur] = rs;
++        uint32_t raw[raw_words(WT)] = {};
++        load_unit<WT>(unit(0), uj, raw);
++        put(raw, 0);
++        if (NS > 1) load_unit<WT>(unit(1), uj, raw);
++        __syncthreads();
++        const bool on = 32 * wn < nrows;
++        const uint8_t* brow[2];
++#pragma unroll
++        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
++        float acc[2][2][8];
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++                for (int i = 0; i < 8; ++i) acc[mt][nt][i] = 0.0f;
++        nw_frag bq[2][4];
++        float bx[2];
++        auto fetch_b = [&](int s, nw_frag (&q)[2][4], float (&x)[2]) {
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) {
++                const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);
++                q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
++                x[nt] = *reinterpret_cast<const float*>(brow[nt] + s * AB + 64);
++            }
++        };
++        if (on) fetch_b(0, bq, bx);
++        for (int s = 0; s < NS; ++s) {
++            __syncthreads();
++            nw_frag nbq[2][4];
++            float nbx[2];
++            if (on && s + 1 < NS) fetch_b(s + 1, nbq, nbx);
++            if (on) {
++                const int bf = s & 1;
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt) {
++                    const int rb = 32 * wm + 16 * mt;
++                    nw_f8 t[2] = {nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
++#pragma unroll
++                    for (int h = 0; h < 2; ++h) {
++                        const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
++                        const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
++#pragma unroll
++                        for (int nt = 0; nt < 2; ++nt)
++                            t[nt] = nw_wmma_f8(A1, nw_v(bq[nt][2 * h + 1]), nw_wmma_f8(A0, nw_v(bq[nt][2 * h]), t[nt]));
++                    }
++#pragma unroll
++                    for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) acc[mt][nt][i] = fmaf(t[nt][i], bx[nt], acc[mt][nt][i]);
++                }
++            }
++            if (s + 1 < NS) {
++                put(raw, (s + 1) & 1);
++                __syncthreads();
++                if (s + 2 < NS) load_unit<WT>(unit(s + 2), uj, raw);
++                if (on) {
++#pragma unroll
++                    for (int nt = 0; nt < 2; ++nt) {
++                        bx[nt] = nbx[nt];
++#pragma unroll
++                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
++                    }
++                }
++            }
++        }
++        if (on) {
++#pragma unroll
++            for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++                for (int nt = 0; nt < 2; ++nt) {
++                    const int r = 32 * wn + 16 * nt + l16, f0 = 32 * wm + 16 * mt + 8 * hi;
++                    if (r < nrows) {
++                        float v[8];
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) v[i] = acc[mt][nt][i] * rsc[f0 + i];
++                        if constexpr (D16) {
++                            uint4* d = reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + r) * 2560 + rbase + f0);
++                            *d = make_uint4(bf16x2_rn(v[0], v[1]), bf16x2_rn(v[2], v[3]), bf16x2_rn(v[4], v[5]), bf16x2_rn(v[6], v[7]));
++                        } else {
++                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + f0);
++                            d[0] = make_float4(v[0], v[1], v[2], v[3]);
++                            d[1] = make_float4(v[4], v[5], v[6], v[7]);
++                        }
++                    }
++                }
++        }
++    }
++#else
++    __builtin_trap();
++#endif
++}
++
++// one block per token: its largest |x| -> ts = max / 448, the row's 2560 values in E4M3 at that scale, in the native
++// activation layout (80 bytes per 64 values: 64 codes, then ts in the block's first scale slot)
++__global__ void __launch_bounds__(256) quant_act_f8_kernel(const float* __restrict__ x, int cols, uint8_t* __restrict__ xa) {
++#if STRATA_NAT_W12
++    const int64_t r = blockIdx.x;
++    const float* xr = x + r * cols;
++    __shared__ float red[256];
++    float m = 0.0f;
++    for (int i = threadIdx.x; i < cols; i += 256) m = fmaxf(m, fabsf(xr[i]));
++    red[threadIdx.x] = m;
++    __syncthreads();
++    for (int o = 128; o > 0; o >>= 1) {
++        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
++        __syncthreads();
++    }
++    const float ts = red[0] > 0.0f ? red[0] / 448.0f : 1.0f, inv = 1.0f / ts;
++    uint8_t* o = xa + r * (int64_t) (cols / 64) * AB;
++    for (int i = 4 * threadIdx.x; i < cols; i += 4 * 256) {   // four values a store
++        const float4 v = *reinterpret_cast<const float4*>(xr + i);
++        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.x * inv, v.y * inv, 0, false);
++        pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.z * inv, v.w * inv, pk, true);
++        *reinterpret_cast<int*>(o + (i / 64) * AB + (i % 64)) = pk;
++    }
++    for (int k = threadIdx.x; k < cols / 64; k += 256) *reinterpret_cast<float*>(o + k * AB + 64) = ts;
++#else
++    __builtin_trap();
++#endif
++}
+ #endif  // __HIPCC__
+ 
+ unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
+@@ -1145,6 +1568,35 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
+     ck(cudaGetLastError(), "quantize_act_native");
+ }
+ 
++bool dm16_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_PF_DM16"); return v != nullptr && v[0] == '1'; }();
++    if (!on) return false;
++    const DevInfo& d = dev_info();
++    return d.ok && d.w12;
++}
++
++bool native_f8_gu(int gu_type) {
++    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_F8"); return v != nullptr && v[0] == '1'; }();
++    if (!on || !f8_gu_type(gu_type)) return false;
++    const DevInfo& d = dev_info();
++    return d.ok && d.w12;
++}
++
++void quantize_act_f8(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
++    if (rows <= 0) return;
++#if defined(__HIPCC__)
++    static bool said = false;
++    if (!said) {
++        said = true;
++        std::fprintf(stderr, "strata: prompt gate/up experts on the FP8 matrix cores (STRATA_PF_FUSED_F8=1)\n");
++    }
++    quant_act_f8_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, (int) cols, (uint8_t*) xa);
++    ck(cudaGetLastError(), "quantize_act_f8");
++#else
++    (void) x; (void) cols; (void) xa; (void) stream;
++#endif
++}
++
+ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
+                     const int32_t* src, void* ha, float* dm, void* stream) {
+     if (b.e1 <= b.e0 || n <= 0) return;
+@@ -1179,6 +1631,19 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
+         const uint8_t* xa8 = (const uint8_t*) xa;
+         uint8_t* ha8 = (uint8_t*) ha;
+ #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
++        static const bool f8d_env = [] { const char* v = std::getenv("STRATA_PF_FUSED_F8D"); return v == nullptr || v[0] != '0'; }();
++        const bool f8_d = d.w12 && f8d_env && native_f8_gu(g.gu_type) && f8_d_type(g.d_type);
++#define STRATA_NW_GU8(T) do { if (f8_d) native_w12f8_gu_kernel<T, true, NW_LB, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8); else native_w12f8_gu_kernel<T, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8); } while (0)
++        if (d.w12 && native_f8_gu(g.gu_type)) {   // STRATA_PF_FUSED_F8: xa came from quantize_act_f8
++            switch (g.gu_type) {
++                case T_IQ2_XXS: STRATA_NW_GU8(T_IQ2_XXS); break;
++                case T_IQ2_XS: STRATA_NW_GU8(T_IQ2_XS); break;
++                case T_IQ2_S: STRATA_NW_GU8(T_IQ2_S); break;
++                case T_IQ3_XXS: STRATA_NW_GU8(T_IQ3_XXS); break;
++                case T_IQ3_S: STRATA_NW_GU8(T_IQ3_S); break;
++                default: STRATA_NW_GU8(T_IQ4_XS); break;
++            }
++        } else
+         switch (g.gu_type) {
+             case T_IQ2_XXS: STRATA_NW_GU(T_IQ2_XXS); break;
+             case T_IQ2_XS: STRATA_NW_GU(T_IQ2_XS); break;
+@@ -1190,7 +1655,16 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
+             default: STRATA_NW_GU(T_IQ4_XS); break;
+         }
+ #undef STRATA_NW_GU
+-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
++#undef STRATA_NW_GU8
++#define STRATA_NW_D8(T) do { if (dm16_on()) native_w12f8_d_kernel<T, NW_LB, true><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, dm); else native_w12f8_d_kernel<T, NW_LB, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, dm); } while (0)
++        if (f8_d) {
++            if (g.d_type == T_Q2_0) STRATA_NW_D8(T_Q2_0);
++            else STRATA_NW_D8(T_IQ4_NL);
++            ck(cudaGetLastError(), "experts_native");
++            return;
++        }
++#undef STRATA_NW_D8
++#define STRATA_NW_D(T) do { if (d.w12 && dm16_on()) native_w11_kernel<T, false, true, NW_LB, true><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
+         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
+         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
+         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 15078dbf..bcffa3bb 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -89,6 +89,9 @@ void group(const int32_t*, int64_t, int, int, void*, int32_t*, int32_t*, void*)
+ void experts(const Batch&, int, int64_t, const void*, const void*, const int32_t*, void*, float*, void*) {}
+ bool native_supported(int, int) { return false; }
+ void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
++bool native_f8_gu(int) { return false; }
++bool dm16_on() { return false; }
++void quantize_act_f8(const float*, int64_t, int64_t, void*, void*) {}
+ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
+                     float*, void*) {}
+ }  // namespace strata::prefill::fused
+@@ -282,7 +285,13 @@ inline int ring_slots(size_t T) {
+         const char* e = std::getenv("STRATA_HIP_WMMA");
+         return e != nullptr && e[0] == '1';
+     }();
+-    if (!v && g_ring_override <= 0 && wmma) return (int64_t) T >= stream_all_min() ? 96 : STAGE;
++    // R9700, all experts in RAM, fused experts: a 384-slot ring reads 4K prompts 2,350 -> 2,650 tok/s (more blobs in flight
++    // for a chunk whose experts get ~80 rows each) and 16K 1% slower, so chunks up to STRATA_PREFILL_RING_SMALL_MAX tokens
++    // (default 8192) take STRATA_PREFILL_RING_SMALL slots (default 384; 96 = as before), longer ones 96
++    static const int small_ring = [] { const char* e = std::getenv("STRATA_PREFILL_RING_SMALL"); return e ? std::atoi(e) : 384; }();
++    static const int64_t small_max = [] { const char* e = std::getenv("STRATA_PREFILL_RING_SMALL_MAX"); return e ? (int64_t) std::atoll(e) : (int64_t) 8192; }();
++    if (!v && g_ring_override <= 0 && wmma)
++        return (int64_t) T >= stream_all_min() ? ((int64_t) T <= small_max ? std::max(16, std::min(small_ring, ring_cap())) : 96) : STAGE;
+ #endif
+     // the byte budget as this pack's slots: 1024 fused / 384 not on Q2_0, fewer on a pack with bigger blobs.  The
+     // unpinned arm stays a slot count (96): it was measured where the host copies are the limit, and there the ring
+@@ -735,6 +744,7 @@ struct PinnedUpload {
+ };
+ 
+ struct Prefill::Impl {
++    bool dm16 = false;   // STRATA_PF_DM16: this layer's down rows were stored as BF16 (set per layer, cleared after its combine)
+     const core::WeightTable* wt = nullptr;
+     const core::ModelGeometry* g = nullptr;
+     core::SessionState* ss = nullptr;
+@@ -2959,6 +2969,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
+                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
+                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
++                    m.dm16 = fused_nat && fused::dm16_on();   // the down rows of this layer in BF16 (combine reads them so)
+                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
+                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
+                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
+@@ -2992,7 +3003,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         }
+                         pt.mark(kPfGather, cs);
+                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
+-                        if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
++                        if (fused_nat && fused::native_f8_gu(mmq_gt)) fused::quantize_act_f8(m.mixed, T, N, m.Xq, m.cs);
++                        else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
+                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
+@@ -3895,8 +3907,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
+                     else if (peer_now && m.pp->sums)
+                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
++                    else if (m.dm16)
++                        moe_combine_bf16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                     else
+                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
++                    m.dm16 = false;
+                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
+                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+                         cudaStreamSynchronize(m.cs);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 4aa057db..75e1469e 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -246,6 +246,330 @@ bool refill_blocking() {
+     return v;
+ }
+ 
++// STRATA_REFILL_BATCH=N (opt-in, low-RAM work): a prompt's lent slots are refilled N experts at a time - the batch read by
++// STRATA_REFILL_THREADS (default 8) threads into one of two pinned staging buffers, its copies queued while the next
++// batch reads.  The per-expert loop read one blob at a time from the mapping, so with the experts on an SSD one read was
++// in flight.  The same bytes land in the same slots.
++int refill_batch() {
++    static const int v = [] { const char* e = std::getenv("STRATA_REFILL_BATCH"); return e ? std::max(0, std::atoi(e)) : 0; }();
++    return v;
++}
++bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
++                    const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, std::string& err) {
++    static const int threads = [] {
++        const char* e = std::getenv("STRATA_REFILL_THREADS");
++        return e ? std::max(1, std::atoi(e)) : 8;
++    }();
++    const size_t B = (size_t) refill_batch();
++    size_t maxb = 0;
++    for (const auto& pr : lent)
++        maxb = std::max(maxb, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
++    maxb = (maxb + 4095) / 4096 * 4096;
++    uint8_t* stage[2] = {nullptr, nullptr};
++    for (auto& st : stage)
++        if (cudaMallocHost((void**) &st, B * maxb) != cudaSuccess) {
++            cudaGetLastError();
++            for (auto& x : stage) if (x != nullptr) cudaFreeHost(x);
++            err = "refill: cannot pin the staging buffers";
++            return false;
++        }
++    bool ok = true;
++    // the reading threads live for the whole refill: an unbuffered read keeps an aligned buffer and an AIO context per
++    // thread, which threads started per batch set up and tore down again every 64 experts
++    std::mutex mu;
++    std::condition_variable go_cv, done_cv;
++    uint64_t go = 0;
++    int done = 0;
++    bool quit = false;
++    size_t cur_at = 0, cur_n = 0, cur_k = 0;
++    std::atomic<size_t> next{0};
++    std::atomic<bool> good{true};
++    auto work = [&] {
++        constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
++        int32_t rl[R], re[R];
++        uint8_t* rd[R];
++        for (size_t j0; (j0 = next.fetch_add(R)) < cur_n;) {
++            const size_t m = std::min(R, cur_n - j0);
++            for (size_t q = 0; q < m; ++q) {
++                const auto& pr = lent[cur_at + j0 + q];
++                rl[q] = (int32_t) (pr.first / n_expert);
++                re[q] = (int32_t) (pr.first % n_expert);
++                rd[q] = stage[cur_k] + (j0 + q) * maxb;
++            }
++            if (!src.copy_blobs(rl, re, rd, m)) good = false;
++        }
++    };
++    std::vector<std::thread> ts;
++    for (int t = 1; t < threads; ++t)
++        ts.emplace_back([&] {
++            for (uint64_t seen = 0;;) {
++                {
++                    std::unique_lock<std::mutex> lk(mu);
++                    go_cv.wait(lk, [&] { return quit || go != seen; });
++                    if (quit) return;
++                    seen = go;
++                }
++                work();
++                {
++                    std::lock_guard<std::mutex> lk(mu);
++                    ++done;
++                }
++                done_cv.notify_one();
++            }
++        });
++    for (size_t at = 0, k = 0; ok && at < lent.size(); at += B, k ^= 1) {
++        const size_t n = std::min(B, lent.size() - at);
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            cur_at = at;
++            cur_n = n;
++            cur_k = k;
++            next.store(0);
++            done = 0;
++            ++go;
++        }
++        go_cv.notify_all();
++        work();
++        {
++            std::unique_lock<std::mutex> lk(mu);
++            done_cv.wait(lk, [&] { return done == (int) ts.size(); });
++        }
++        if (!good) { err = "refill: reading a lent expert failed"; ok = false; break; }
++        // the previous batch's copies (out of the other buffer) land before that buffer is read into again
++        if (!cache.sync_queued(err)) { ok = false; break; }
++        for (size_t j = 0; ok && j < n; ++j) {
++            const auto& pr = lent[at + j];
++            const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert);
++            if (!cache.fill_slot_queued(pr.second, stage[k] + j * maxb, err, nb)) ok = false;
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lk(mu);
++        quit = true;
++    }
++    go_cv.notify_all();
++    for (auto& t : ts) t.join();
++    if (ok && !cache.sync_queued(err)) ok = false;
++    for (auto& st : stage) cudaFreeHost(st);
++    return ok;
++}
++
++// STRATA_REFILL_ASYNC=1 (opt-in): a prompt's lent slots are refilled while the answer is
++// written instead of before its first token.  Reader threads read the lent experts (hottest first) into four pinned
++// buffers of STRATA_REFILL_BATCH/2 experts - the memory the blocking refill's two buffers take - and the host thread,
++// between two windows (`poll`), queues each read batch's copies on a stream of its own and marks the batch's experts
++// resident once its event has passed.  Until then an expert of the loan is missing, as a slot's windows see it beside a
++// prompt read with --batch: the CPU computes it.  The tokens can differ from the blocking refill's (an expert on the CPU
++// rounds differently), and from run to run, as with the adaptive tier's timing (#463).  Every place that lends or
++// gives up slots calls `finish` first, so a slot is never refilled under a prompt buffer or a KV page.
++class AsyncRefill {
++public:
++    ~AsyncRefill() { stop(); }
++    bool active() const { return !lent_.empty(); }
++    // `lent` in the order to refill (the hottest first); false (nothing started) when the buffers cannot be pinned
++    bool start(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
++               std::vector<std::pair<int32_t, int32_t>> lent, int64_t n_expert, std::string& err) {
++        if (lent.empty()) return true;
++        src_ = &src;
++        cache_ = &cache;
++        n_expert_ = n_expert;
++        // without STRATA_REFILL_BATCH the experts are copied straight from where the source keeps them (the RAM arena, page-
++        // locked: a DMA each, as the blocking refill does), STRATA_REFILL_ASYNC_DIRECT experts a batch (default 256)
++        direct_ = refill_batch() <= 0;
++        if (direct_) {
++            static const int db = [] { const char* e = std::getenv("STRATA_REFILL_ASYNC_DIRECT"); return e ? std::max(16, std::atoi(e)) : 256; }();
++            B_ = (size_t) db;
++        } else {
++            B_ = (size_t) std::max(8, refill_batch() / 2);
++        }
++        maxb_ = 0;
++        for (const auto& pr : lent)
++            maxb_ = std::max(maxb_, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
++        maxb_ = (maxb_ + 4095) / 4096 * 4096;
++        for (Buf& b : buf_) {
++            if ((!direct_ && cudaMallocHost((void**) &b.mem, B_ * maxb_) != cudaSuccess) || cudaEventCreateWithFlags(&b.ev, cudaEventDisableTiming) != cudaSuccess) {
++                (void) cudaGetLastError();
++                release();
++                err = "refill: cannot pin the background refill's buffers";
++                return false;
++            }
++        }
++        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
++            (void) cudaGetLastError();
++            release();
++            err = "refill: cannot create the background refill's stream";
++            return false;
++        }
++        lent_ = std::move(lent);
++        n_batches_ = (lent_.size() + B_ - 1) / B_;
++        next_batch_ = 0;
++        committed_ = 0;
++        failed_ = false;
++        quit_ = false;
++        t0_ = std::chrono::steady_clock::now();
++        if (!direct_)
++            for (int t = 0; t < kBufs; ++t) readers_.emplace_back([this] { read_loop(); });
++        return true;
++    }
++    // Between two windows: queues the copies of the batches read so far and marks the experts of the batches whose
++    // copies have landed resident.  `wait`: until everything is in.  Returns how many experts became resident (the
++    // caller uploads the table when that is not 0), or -1 when a read or a copy failed.
++    int64_t poll(std::vector<int32_t>& host_res, bool wait, std::string& err) {
++        if (!active()) return 0;
++        int64_t made = 0;
++        for (;;) {
++            std::unique_lock<std::mutex> lk(mu_);
++            if (failed_) { err = "refill: reading a lent expert failed"; return -1; }
++            bool progress = false;
++            if (direct_)   // the free batches take the next experts, straight from the source's memory
++                for (Buf& b : buf_) {
++                    if (b.state != kFree || next_batch_ >= n_batches_) continue;
++                    b.at = next_batch_ * B_;
++                    b.n = std::min(B_, lent_.size() - b.at);
++                    ++next_batch_;
++                    for (size_t j = 0; j < b.n; ++j) {
++                        const auto& pr = lent_[b.at + j];
++                        const int64_t layer = pr.first / n_expert_, nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
++                        const uint8_t* blob = src_->blob_stable(layer, pr.first % n_expert_);
++                        if (blob == nullptr) { err = "refill: a lent expert is not in memory"; return -1; }
++                        if (!cache_->fill_slot(pr.second, blob, stream_, err, nb)) return -1;
++                    }
++                    if (cudaEventRecord(b.ev, stream_) != cudaSuccess) {
++                        err = std::string("refill: ") + cudaGetErrorString(cudaGetLastError());
++                        return -1;
++                    }
++                    b.state = kIssued;
++                }
++            for (Buf& b : buf_) {
++                if (b.state == kReady) {
++                    for (size_t j = 0; j < b.n; ++j) {
++                        const auto& pr = lent_[b.at + j];
++                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert_);
++                        if (!cache_->fill_slot(pr.second, b.mem + j * maxb_, stream_, err, nb)) return -1;
++                    }
++                    if (cudaEventRecord(b.ev, stream_) != cudaSuccess) {
++                        err = std::string("refill: ") + cudaGetErrorString(cudaGetLastError());
++                        return -1;
++                    }
++                    b.state = kIssued;
++                }
++                if (b.state == kIssued) {
++                    const cudaError_t q = wait ? cudaEventSynchronize(b.ev) : cudaEventQuery(b.ev);
++                    if (q == cudaErrorNotReady) { (void) cudaGetLastError(); continue; }
++                    if (q != cudaSuccess) {
++                        err = std::string("refill: ") + cudaGetErrorString(q);
++                        return -1;
++                    }
++                    for (size_t j = 0; j < b.n; ++j) {
++                        const auto& [i, slot] = lent_[b.at + j];
++                        // (an expert the table placed elsewhere meanwhile keeps that place; its old slot stays empty)
++                        if (host_res[(size_t) i] == strata::core::kNotResident) {
++                            host_res[(size_t) i] = slot;
++                            ++made;
++                        }
++                    }
++                    committed_ += b.n;
++                    b.state = kFree;
++                    progress = true;
++                }
++            }
++            if (progress) cv_.notify_all();
++            if (committed_ == lent_.size()) {
++                lk.unlock();
++                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0_).count();
++                if (std::getenv("STRATA_TRACE") != nullptr)
++                    std::fprintf(stderr, "strata trace: background refill of %zu slots done in %.1f ms\n", lent_.size(), ms);
++                stop();
++                return made;
++            }
++            if (!wait) return made;
++            if (!progress) cv_.wait_for(lk, std::chrono::milliseconds(2));
++        }
++    }
++    bool finish(std::vector<int32_t>& host_res, std::string& err) { return poll(host_res, true, err) >= 0; }
++
++private:
++    enum { kFree = 0, kReading, kReady, kIssued };
++    static constexpr int kBufs = 4;
++    struct Buf { uint8_t* mem = nullptr; cudaEvent_t ev = nullptr; int state = kFree; size_t at = 0, n = 0; };
++    void read_loop() {
++        for (;;) {
++            Buf* b = nullptr;
++            {
++                std::unique_lock<std::mutex> lk(mu_);
++                cv_.wait(lk, [&] {
++                    if (quit_ || failed_ || next_batch_ >= n_batches_) return true;
++                    for (Buf& x : buf_) if (x.state == kFree) return true;
++                    return false;
++                });
++                if (quit_ || failed_ || next_batch_ >= n_batches_) return;
++                for (Buf& x : buf_) if (x.state == kFree) { b = &x; break; }
++                b->state = kReading;
++                b->at = next_batch_ * B_;
++                b->n = std::min(B_, lent_.size() - b->at);
++                ++next_batch_;
++            }
++            constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
++            int32_t rl[R], re[R];
++            uint8_t* rd[R];
++            bool ok = true;
++            for (size_t j0 = 0; ok && j0 < b->n; j0 += R) {
++                const size_t m = std::min(R, b->n - j0);
++                for (size_t q = 0; q < m; ++q) {
++                    const auto& pr = lent_[b->at + j0 + q];
++                    rl[q] = (int32_t) (pr.first / n_expert_);
++                    re[q] = (int32_t) (pr.first % n_expert_);
++                    rd[q] = b->mem + (j0 + q) * maxb_;
++                }
++                ok = src_->copy_blobs(rl, re, rd, m);
++            }
++            {
++                std::lock_guard<std::mutex> lk(mu_);
++                if (!ok) failed_ = true;
++                else b->state = kReady;
++            }
++            cv_.notify_all();
++        }
++    }
++    void stop() {
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            quit_ = true;
++        }
++        cv_.notify_all();
++        for (auto& t : readers_) t.join();
++        readers_.clear();
++        if (stream_ != nullptr) (void) cudaStreamSynchronize(stream_);
++        release();
++        lent_.clear();
++    }
++    void release() {
++        for (Buf& b : buf_) {
++            if (b.ev != nullptr) cudaEventDestroy(b.ev);
++            if (b.mem != nullptr) cudaFreeHost(b.mem);
++            b = Buf{};
++        }
++        if (stream_ != nullptr) cudaStreamDestroy(stream_);
++        stream_ = nullptr;
++    }
++    strata::core::ExpertSource* src_ = nullptr;
++    strata::core::ExpertCache* cache_ = nullptr;
++    int64_t n_expert_ = 0;
++    size_t B_ = 0, maxb_ = 0, n_batches_ = 0, next_batch_ = 0, committed_ = 0;
++    std::vector<std::pair<int32_t, int32_t>> lent_;
++    Buf buf_[kBufs];
++    cudaStream_t stream_ = nullptr;
++    std::mutex mu_;
++    std::condition_variable cv_;
++    bool failed_ = false, quit_ = false, direct_ = false;
++    std::vector<std::thread> readers_;
++    std::chrono::steady_clock::time_point t0_;
++};
++bool refill_async_on() {
++    static const bool v = [] { const char* e = std::getenv("STRATA_REFILL_ASYNC"); return e != nullptr && std::atoi(e) != 0; }();
++    return v;
++}
++
+ using Clock = std::chrono::steady_clock;
+ 
+ // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
+@@ -4696,6 +5020,31 @@ int main(int argc, char** argv) {
+         } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
+             src.set_io_stats(true);
+         }
++        // STRATA_PROMPT_DIRECT=1: the prompt's expert copies and the refill read straight from the drive, the rest
++        // as above (under a tight RAM cap the cached reads, not the drives, set the prompt's rate)
++        bool prompt_direct = false;
++        if (const char* pv = std::getenv("STRATA_PROMPT_DIRECT"); pv != nullptr && std::atoi(pv) != 0 && !src.unbuffered()) {
++            std::string why;
++            prompt_direct = src.open_prompt_direct(why);
++            std::fprintf(stderr, "strata generate: prompt reads %s (STRATA_PROMPT_DIRECT=1: %s)\n",
++                         prompt_direct ? "unbuffered" : "through the file cache", why.c_str());
++        }
++        // STRATA_DECODE_DIRECT=1: the decode's blob reads straight from the drive(s) as well (they land in stage buffers,
++        // never in the file cache's pages); STRATA_STAGE_KEEP=N keeps the last N of them in RAM instead
++        if (const char* dv = std::getenv("STRATA_DECODE_DIRECT"); dv != nullptr && std::atoi(dv) != 0 && !src.unbuffered()) {
++            std::string why;
++            if (!prompt_direct) prompt_direct = src.open_prompt_direct(why);
++            src.set_decode_direct(prompt_direct);
++            std::fprintf(stderr, "strata generate: decode reads %s (STRATA_DECODE_DIRECT=1%s%s)\n",
++                         src.decode_direct() ? "unbuffered" : "as before", why.empty() ? "" : ": ", why.c_str());
++        }
++        if (const char* kv = std::getenv("STRATA_STAGE_KEEP"); kv != nullptr && std::atoll(kv) > 0) {
++            src.set_stage_keep((size_t) std::atoll(kv));
++            std::fprintf(stderr, "strata generate: the stage pool keeps up to %lld blobs (STRATA_STAGE_KEEP)\n", std::atoll(kv));
++        }
++        if (src.mirrored() && !prompt_direct && !src.unbuffered())
++            std::fprintf(stderr, "strata generate: note: STRATA_EXPERT_MIRROR serves only the direct reads "
++                                 "(STRATA_PROMPT_DIRECT=1, or an unbuffered file tier); none run here\n");
+         srcp = &src;
+     } else {
+         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
+@@ -7535,6 +7884,8 @@ int main(int argc, char** argv) {
+             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+         }
+         ver.set_remote_expert_opt(remote_opt.get());
++        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
++            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+@@ -8335,6 +8686,18 @@ int main(int argc, char** argv) {
+             aflipped = false;
+             res_upload();
+         };
++        // STRATA_REFILL_ASYNC: the last prompt's loan, refilled while the answer is written (see AsyncRefill)
++        AsyncRefill arefill;
++        auto arefill_finish = [&]() -> bool {
++            if (!arefill.active()) return true;
++            std::string ae;
++            if (!arefill.finish(host_res, ae)) {
++                std::fprintf(stderr, "strata serve: %s\n", ae.c_str());
++                return false;
++            }
++            res_upload();
++            return true;
++        };
+         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
+         std::function<void()> adapt_fence;
+         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+@@ -9106,6 +9469,7 @@ int main(int argc, char** argv) {
+                 return false;
+             }
+             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
++            if (!arefill_finish()) { e = "VRAM: the background refill failed"; return false; }
+             for (const PfPart& p : pf_parts)
+                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
+             if (!ver.wait_commit(e)) return false;
+@@ -9954,7 +10318,7 @@ int main(int argc, char** argv) {
+                         continue;
+                     }
+                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
++                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
+                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
+                         continue;
+                     }
+@@ -10211,7 +10575,7 @@ int main(int argc, char** argv) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
+-            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
++            auto kv_quiesce = [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); };
+             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
+                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
+                 if (!kvg_ensure(n + 256, kv_quiesce)) {
+@@ -10714,6 +11078,21 @@ int main(int argc, char** argv) {
+             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+                 tr("refill start", (long long) p.lent.size());
+                 const strata::core::OnDevice on(p.dev);
++                if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
++                    // the experts the RAM copy holds (STRATA_BUDGET_LEND_GIB keeps the loan's there) go back from it by
++                    // DMA; only the rest are read from the drive
++                    std::vector<std::pair<int32_t, int32_t>> rest;
++                    rest.reserve(p.lent.size());
++                    for (const auto& [i, slot] : p.lent) {
++                        const uint8_t* rb = src.complement_ready() ? src.resident_blob(i / g.n_expert, i % g.n_expert) : nullptr;
++                        if (rb == nullptr) { rest.emplace_back(i, slot); continue; }
++                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
++                        if (!p.cache->fill_slot_queued(slot, rb, e, nb)) return false;
++                    }
++                    if (!rest.empty() && !refill_batched(*srcp, *p.cache, rest, g.n_expert, e)) return false;
++                    for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
++                    return true;
++                }
+                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+@@ -10768,11 +11147,40 @@ int main(int argc, char** argv) {
+                 }
+                 return true;
+             };
++            // STRATA_REFILL_ASYNC: the loan goes back while the answer is written (one card, no --batch slots, no peer
++            // or helper GPU); the hottest experts first, by the adaptive tier's counts and then the profile's rank
++            auto refill_or_async = [&](std::string& e) -> bool {
++                if (!refill_async_on() || pf_parts.size() != 1 || !stages.empty() || o.batch > 0 || peer.valid() ||
++                    pf_parts[0].lent.empty())
++                    return refill(e);
++                PfPart& p = pf_parts[0];
++                std::vector<int32_t> rank(host_res.size(), (int32_t) profile.size());
++                for (size_t r = 0; r < profile.size(); ++r)
++                    rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
++                auto heat = [&](int32_t i) -> double {
++                    const double u = drive.d.usage.empty() ? 0.0 : (double) drive.d.usage[(size_t) i];
++                    return u * 1048576.0 - (double) rank[(size_t) i];
++                };
++                std::vector<std::pair<int32_t, int32_t>> order = p.lent;
++                std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return heat(a.first) > heat(b.first); });
++                const strata::core::OnDevice on(p.dev);
++                std::string ae;
++                if (!arefill.start(*srcp, *p.cache, std::move(order), g.n_expert, ae)) {
++                    std::fprintf(stderr, "strata serve: %s; refilling now\n", ae.c_str());
++                    return refill(e);
++                }
++                tr("refill in the background", (long long) p.lent.size());
++                p.lent.clear();
++                p.lent_chunk = 0;
++                return true;
++            };
+             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+             // participant's own cache, and marking only that participant's own layers
+             auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
++                // the last prompt's loan, still going back in the background, lands first: those slots are lent again
++                if (!arefill_finish()) { e = "prefill: the background refill failed"; return false; }
+                 const auto t_ln = Clock::now();
+                 // what this segment needs, capped by the configured chunk: a request lends only what its own
+                 // prompt needs, so a large chunk costs a short prompt nothing
+@@ -11040,7 +11448,7 @@ int main(int argc, char** argv) {
+                 if (to <= at) continue;
+                 err.clear();
+                 const bool win = windows_ok(at, to);
+-                if (win && !refill(err)) {
++                if (win && !refill_or_async(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+                 }
+@@ -11090,7 +11498,7 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
+                                  (long long) message_at, (long long) (turn_at - message_at));
+             }
+-            if (!refill(err)) {
++            if (!refill_or_async(err)) {
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                 return 1;
+             }
+@@ -11853,6 +12261,16 @@ int main(int argc, char** argv) {
+                 drive.d.layers = 0;
+                 drive.d.experts = 0;
+                 drive.d.failed = false;
++                // STRATA_REFILL_ASYNC: the loan's batches whose copies have landed are resident from this window on
++                if (arefill.active()) {
++                    std::string ae;
++                    const int64_t made = arefill.poll(host_res, false, ae);
++                    if (made < 0) {
++                        std::printf("ERR the background refill failed: %s\n", ae.c_str());
++                        return 1;
++                    }
++                    if (made > 0) res_upload();
++                }
+                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
+                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
+                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+@@ -11890,7 +12308,7 @@ int main(int argc, char** argv) {
+                 }
+                 // the elastic K/V: the window's cells and the drafter's beyond them
+                 if (kvg.on && p + T + 64 > kvg.cells &&
+-                    !kvg_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
++                    !kvg_ensure(p + T + 64, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
+                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
+                     return 1;
+                 }
+@@ -12210,6 +12628,10 @@ int main(int argc, char** argv) {
+                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
+                         (long long) req_offload, chain_txt);
+             std::fflush(stdout);
++            if (!arefill_finish()) {   // the answer is out: what is left of the loan goes back before the next request
++                std::printf("ERR the background refill failed\n");
++                return 1;
++            }
+             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                             (int64_t) live.size() == p;
+@@ -12492,7 +12914,14 @@ int main(int argc, char** argv) {
+         // refill the lent slots from the arena and give them back to the decode tier
+         if (!lent.empty()) {
+             const Clock::time_point tr = Clock::now();
+-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
++            if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
++                if (!refill_batched(*srcp, xcache, lent, g.n_expert, err)) {
++                    std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
++                    return 1;
++                }
++                for (const auto& [i, slot] : lent) host_res[(size_t) i] = slot;
++            }
++            else for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
+@@ -12798,6 +13227,8 @@ int main(int argc, char** argv) {
+         vh.blob = thits.blob;
+         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
+         vh.n_slots = xcache.slots();
++        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
++            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+@@ -13229,6 +13660,17 @@ int main(int argc, char** argv) {
+                             (unsigned long long) ic.pf_dropped, (double) ic.pread_bytes / 1e6,
+                             (unsigned long long) ic.pread_n, ic.pread_n > 0 ? (double) ic.pread_us / 1e3 / (double) ic.pread_n : 0.0,
+                             rounds > 0 ? (double) ic.crit_us / 1e3 / rounds : 0.0);
++                if (rounds > 0)
++                    std::printf("%-24s per round: %.1f staged already, %.1f being read ahead (layers waited %.2f ms), %.1f read on "
++                                "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
++                                (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
++                                (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
++                if (rounds > 0 && ic.rd_n > 0)
++                    std::printf("%-24s %.1f blobs per round: drive %.3f ms, bounce copy %.3f ms each (thread time)\n", "direct reads",
++                                (double) ic.rd_n / rounds, (double) ic.rd_io_us / 1e3 / (double) ic.rd_n, (double) ic.rd_copy_us / 1e3 / (double) ic.rd_n);
++                if (rounds > 0 && drive.d.skipped > 0)
++                    std::printf("%-24s %.1f entries per round left out (STRATA_EXPERT_SKIP)\n", "expert skip",
++                                (double) drive.d.skipped / rounds);
+             }
+             if (drive.d.lookahead != nullptr)
+                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "
+diff --git a/tools/r9700/build-r9700.sh b/tools/r9700/build-r9700.sh
+new file mode 100755
+index 00000000..363ed211
+--- /dev/null
++++ b/tools/r9700/build-r9700.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++# tools/r9700/build-r9700.sh <ROCm 10 SDK dir> <build dir> [name]: the engine for the Radeon AI PRO R9700 / RX 9070
++# (gfx1201) against AMD TheRock ROCm 10 (its hipBLASLt 1.5 matches tools/hip/gfx1201-hipblaslt-100500.txt), copied to
++# engine/<name> (default strata-r9700).  The CPU image encoder (tools/vision) builds as setup.py does it:
++#   cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=<llama.cpp source> \
++#         -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=OFF && cmake --build build-vision --target strata-vision
++# The SDK dir is the _rocm_sdk_devel folder of a `pip install "rocm[libraries,devel,device-gfx1201]"` from
++# https://nightly.repo.amd.com/rocm/whl-next/ (for example 10.2.0a20261009).
++set -e
++SDK=${1:?the ROCm 10 SDK dir (.../_rocm_sdk_devel)}; B=${2:-build-r9700}; NAME=${3:-strata-r9700}
++cd "$(dirname "$0")/../.."
++export ROCM_PATH=$SDK HIP_PATH=$SDK HIP_PLATFORM=amd
++export PATH=$SDK/bin:$SDK/lib/llvm/bin:$PATH
++export LD_LIBRARY_PATH=$SDK/lib:$SDK/lib/rocm_sysdeps/lib:$SDK/lib/llvm/lib
++cmake -S . -B "$B" -DCMAKE_BUILD_TYPE=Release \
++  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PREFILL_MMQ=ON -DSTRATA_NATIVE_EXPERTS=ON \
++  -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DGPU_TARGETS=gfx1201 -DHIP_PLATFORM=amd -DCMAKE_HIP_PLATFORM=amd \
++  -DCMAKE_HIP_COMPILER=$SDK/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
++  "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
++  "-DCMAKE_HIP_FLAGS=-isystem $SDK/include --rocm-path=$SDK --rocm-device-lib-path=$SDK/lib/llvm/amdgcn/bitcode" \
++  "-DCMAKE_CXX_FLAGS=-isystem $SDK/include"
++cmake --build "$B" --target strata -j "$(nproc)"
++mkdir -p engine && cp "$B/strata" "engine/$NAME"
++echo "built engine/$NAME"
