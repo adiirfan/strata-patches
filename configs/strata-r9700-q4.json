@@ -32,7 +32,7 @@
   "--prompt-cache-every",
   "0",
   "--resident-budget-gib",
-  "13",
+  "6.5",
   "--batch-mtp"
  ],
  "cwd": ".",

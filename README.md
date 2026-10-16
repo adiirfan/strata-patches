@@ -125,7 +125,7 @@ as any change of cache size does in Strata: lazy loading's spare memory, `--kv-g
 
 Everything is opt-in, except the conversation memory below. `configs/strata-r9700-allram.json` (experts in RAM, about
 55 GB), `configs/strata-r9700-28g.json` (28 GB, 256K context) and `configs/strata-r9700-q4.json` (the UD-Q4_K_XL model,
-262K context, 2 slots, about 22-25 GB, for a hard 28 GB limit) set it all.
+262K context, 2 slots, 15-26 GB, for a hard 28 GB limit) set it all.
 
 | Setting | What it does |
 | --- | --- |
@@ -458,8 +458,21 @@ the conversations to grow: a cap reached by the engine coincided with non-finite
 The lowest available RAM was 26 GB of 94, with no swapping. Under a 28 GB cap with a 17 GiB share and 131K context it
 also ran beside a render: 4K 578, 16K 1,728, 64K 2,150 tokens/s.
 
-**A hard 28 GB limit** (`configs/strata-r9700-q4.json`: a 13 GiB RAM share; the server in a systemd scope with
-`MemoryMax=28G`, `MemoryHigh=26G` and no swap), 262K context, beside an H3 render:
+**A hard 28 GB limit.** `configs/strata-r9700-q4.json` runs the server in a systemd scope with `MemoryMax=28G`,
+`MemoryHigh=27G` and no swap, with a 6.5 GiB RAM share for the experts and 2 slots. The share is small so that the
+worst case fits: the main session and both slots each holding a full 262K conversation (about 3.6 GB each). Three
+conversations of about 242,000 tokens held at once took 25.1 GB (peak 25.5); with nothing long held, 15.1 GB.
+
+| Prompt | Prompt, tokens/s | Writing, tokens/s |
+| --- | ---: | ---: |
+| 1K | 153 | 31.4 |
+| 4K | 455 | 48.1 |
+| 16K | 1,511 | 50.1 |
+| 64K | 2,128 | 51.2 |
+| 242K | 1,764 | – |
+
+The same limit with a 13 GiB share and 4 slots (which fits only while the conversations held stay under about
+400,000 tokens in all), beside an H3 render:
 
 | | Result |
 | --- | ---: |
