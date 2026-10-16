@@ -147,6 +147,43 @@ index 5d16d997..9bcb1775 100644
      int64_t complement_lent_slots_ = 0;
      std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
      std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+diff --git a/include/strata/core/layer.hpp b/include/strata/core/layer.hpp
+index 9e0361ac..9a143b66 100644
+--- a/include/strata/core/layer.hpp
++++ b/include/strata/core/layer.hpp
+@@ -271,6 +271,7 @@ struct QsaState {
+     /// copy and give back the overlap the doorbell protocol exists for.
+     int32_t* host_step = nullptr;    ///< (kStepCount + 1,) pinned; final element is attention status
+     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
++    int host_lazy = -1;              ///< its lazy host copy (qsa_kv_host_ensure), -1: none or pinned whole
+ };
+ 
+ /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
+@@ -306,6 +307,10 @@ int64_t qsa_kv_resident();
+ int64_t qsa_kv_resident_min();
+ /// Pinned host bytes the streamed states hold (their host copies).
+ uint64_t qsa_kv_host_bytes();
++/// The lazy host copy (STRATA_KV_HOST_LAZY, default on): pin this state's host copy up to `cells` cells (growing half as
++/// much again at a time, in STRATA_KV_HOST_STEP steps, 8192), before anything writes or copies cells up to there.  A
++/// state without one: true.  False when RAM cannot be pinned.
++bool qsa_kv_host_ensure(const QsaState& st, int64_t cells);
+ /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
+ /// initializing the session; default off until gate G-C accepts it.
+ void qsa_set_kv_int8(bool enabled);
+diff --git a/include/strata/core/session.hpp b/include/strata/core/session.hpp
+index 4d633205..313b4fe3 100644
+--- a/include/strata/core/session.hpp
++++ b/include/strata/core/session.hpp
+@@ -103,6 +103,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
+ /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
+ /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
+ void session_release(SessionState& s);
++
++/// The lazy host copies of the session's attention layers (qsa_kv_host_ensure) pinned up to `cells` cells.
++bool session_kv_host_ensure(const SessionState& s, int64_t cells);
+ /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
+ /// from the reference's own `zeros()`.
+ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
 diff --git a/include/strata/prefill/gemm.hpp b/include/strata/prefill/gemm.hpp
 index 935f1a9a..4ed23c36 100644
 --- a/include/strata/prefill/gemm.hpp
@@ -202,10 +239,121 @@ index 7e63df9b..91ecf21c 100644
  /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
  /// rows of `group`.  `dm` 16-byte aligned (gfx12 stores float4; checked there - the prompt path's buffers are 256-aligned
 diff --git a/serve/server.py b/serve/server.py
-index cb5543ee..d3b19ec7 100644
+index cb5543ee..6ec2f3f2 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -6137,6 +6137,37 @@ def check_request_sampling(req) -> None:
+@@ -55,7 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / "tools"))
+ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
++                            forced_call, image_details_of, images_of, literal_tags, mark_think_literals,
++                            openai_to_messages,
+                             tool_choice_of, unmark_think_literals)
+ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+ from serve import runconfig  # noqa: E402
+@@ -2011,6 +2012,15 @@ class Vision:
+             args += ["--max-tokens", str(cfg["max_tokens"])]
+         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
+             args += ["--min-tokens", str(cfg["min_tokens"])]
++        # "default_max_tokens" (opt-in, under "max_tokens"): an image whose part does not ask for detail "high" is
++        # shrunk here to what the encoder would make of it at that many tokens, so "max_tokens" becomes the ceiling a
++        # request reaches only by asking.  A redraw judged at 276 tokens was a coin toss on "drawn or photographed
++        # skin" (11 of 36 checks wrong) and right 36 of 36 at 989, but a watcher's 15 frames at the larger size took
++        # 209 s on the CPU instead of 38.  "token_px": the pixels one image token covers along a side (Qwen-VL: a
++        # 16-pixel patch, 2x2 merged = 32).
++        ceiling, default = int(cfg.get("max_tokens") or 0), int(cfg.get("default_max_tokens") or 0)
++        self.default_tokens = default if default > 0 and (ceiling <= 0 or default < ceiling) else 0
++        self.token_px = int(cfg.get("token_px") or 32)
+         self.dir = self.work_dir()
+         self.spawn = (args, log, env)                   # to start it again after an unload
+         self.proc = None
+@@ -2168,19 +2178,67 @@ class Vision:
+         im.save(out, format="PNG")
+         return out.getvalue()
+ 
+-    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
++    def encode_all(self, sources: list, details: list | None = None) -> list[tuple[Path, int]]:
+         """encode() for every image of one request: the files of this request's earlier images are never evicted to
+         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
+-        had read it)."""
++        had read it).  `details`: each image's detail ("high" reaches max_tokens), in the same order."""
+         out: list[tuple[Path, int]] = []
+-        for src in sources:
+-            out.append(self.encode(src, keep=[p for p, _ in out]))
++        for i, src in enumerate(sources):
++            high = bool(details) and i < len(details) and details[i] == "high"
++            out.append(self.encode(src, keep=[p for p, _ in out], high=high))
+         return out
+ 
+-    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
++    @staticmethod
++    def fit_size(width: int, height: int, max_tokens: int, px: int = 32) -> tuple[int, int]:
++        """The size mtmd's Qwen-VL preprocessing gives an image at `max_tokens` (mtmd-image.cpp
++        calc_size_preserved_ratio): each side rounded to `px`, then, when that is over the budget, both scaled down
++        by one factor and floored to `px`."""
++        def rnd(x):
++            return int(math.floor(x / px + 0.5)) * px
++        w, h = max(px, rnd(width)), max(px, rnd(height))
++        if w * h > max_tokens * px * px:
++            beta = math.sqrt(height * width / (max_tokens * px * px))
++            h = max(px, int(math.floor(height / beta / px)) * px)
++            w = max(px, int(math.floor(width / beta / px)) * px)
++        return w, h
++
++    def fit_default(self, data: bytes) -> bytes:
++        """An image shrunk to default_max_tokens (see __init__) as a PNG, or `data` itself when it already fits, when
++        there is no default, or without Pillow."""
++        default = getattr(self, "default_tokens", 0)
++        if not default:
++            return data
++        try:
++            import io
++            from PIL import Image
++            im = Image.open(io.BytesIO(data))
++            px = getattr(self, "token_px", 32)
++            w, h = self.fit_size(im.width, im.height, default, px)
++            if (w, h) == self.fit_size(im.width, im.height, 1 << 30, px):
++                return data                                    # already within the default: as it was
++            im.load()
++            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
++                im = im.convert("RGBA")
++                bg = Image.new("RGB", im.size, (255, 255, 255))
++                bg.paste(im, mask=im.split()[-1])
++                im = bg
++            elif im.mode != "RGB":
++                im = im.convert("RGB")
++            out = io.BytesIO()
++            im.resize((w, h), Image.BICUBIC).save(out, format="PNG")
++            return out.getvalue()
++        except ImportError:
++            return data
++        except Exception:
++            return data                                        # the encoder says what is wrong with it
++
++    def encode(self, source: str | bytes, keep=(), high: bool = False) -> tuple[Path, int]:
+         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
+-        `keep`: files the caller still needs (never evicted by this call)."""
++        `keep`: files the caller still needs (never evicted by this call).  `high`: the part asked for detail "high"
++        (max_tokens); otherwise default_max_tokens, when the config sets one."""
+         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
++        if not high:
++            data = self.fit_default(data)
+         key = hashlib.sha256(data).hexdigest()[:32]
+         with self.lock:
+             if key in self.cache:
+@@ -3481,8 +3539,9 @@ class Service:
+             # run on the GPU at the same time - an encode during a running request left that request stuck at
+             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+             # same FIFO as the requests.
++            details = image_details_of(messages)
+             with self.fifo:
+-                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
++                encoded = (self.vision.encode_all(images, details) if hasattr(self.vision, "encode_all")
+                            else [self.vision.encode(src) for src in images])
+             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+@@ -6137,6 +6196,37 @@ def check_request_sampling(req) -> None:
              raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
  
  
@@ -243,7 +391,7 @@ index cb5543ee..d3b19ec7 100644
  def main() -> int:
      ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
      ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
-@@ -6400,6 +6431,7 @@ def main() -> int:
+@@ -6400,6 +6490,7 @@ def main() -> int:
          hub.start()
          atexit.register(hub.close)                      # the servers Strata started end with it
      httpd = serve(svc, host=a.host, port=a.port)
@@ -1080,6 +1228,209 @@ index ad28f56f..8500dcbd 100644
      if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
          std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
                       (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
+diff --git a/src/core/layer.cpp b/src/core/layer.cpp
+index 3132871c..da14a428 100644
+--- a/src/core/layer.cpp
++++ b/src/core/layer.cpp
+@@ -1,6 +1,7 @@
+ 
+ // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+ #include "strata/core/layer.hpp"
++#include <sys/mman.h>
+ #include "strata/core/native_head.hpp"
+ #include "strata/kernels/bf16_bits.hpp"
+ #include "strata/kernels/bf16_gemv.hpp"
+@@ -517,6 +518,73 @@ namespace {
+ int64_t g_kv_resident = 0;
+ uint64_t g_kv_host_bytes = 0;
+ 
++// ---- the lazy host copy (STRATA_KV_HOST_LAZY, on by default; qsa_kv_host_ensure): every streamed state's host copy is
++// reserved address space, pinned only as far as the longest live conversation reaches.  Pinned up front it was the full
++// context for every layer of every session, used or not: 65 x 132 MiB = 8.6 GiB of a 32 GiB machine at 131K and
++// --batch 4 (the main session and four slots, 13 attention layers each), RAM the expert tier then did not have.
++// Each array starts on its own 2 MiB boundary, so the pieces registered for one array never share a page with another's;
++// the kernels address the copy through the host pointer (ROCm and CUDA map registered memory at the same address,
++// checked once below - where they do not, the state falls back to one pinned allocation).
++struct HostLazy {
++    uint8_t* base = nullptr;
++    uint64_t span = 0;
++    int64_t pages = 0, page_cells = 0, done = 0;   // logical pages, cells per page, pages pinned so far
++    int64_t cells = 0;                             // the cells it was last grown to
++    std::vector<uint64_t> off, per_page, end;      // per array: start, bytes per page, registered end (page aligned)
++};
++std::vector<HostLazy> g_host_lazy;
++int64_t g_kv_host_step = 8192;
++int g_kv_host_lazy = -1;        // -1: read STRATA_KV_HOST_LAZY once
++bool host_lazy_on() {
++    if (g_kv_host_lazy < 0) {
++        const char* v = std::getenv("STRATA_KV_HOST_LAZY");
++        g_kv_host_lazy = v != nullptr && v[0] == '0' ? 0 : 1;
++        if (const char* st = std::getenv("STRATA_KV_HOST_STEP"); st != nullptr && std::atoll(st) > 0)
++            g_kv_host_step = std::atoll(st);
++    }
++    return g_kv_host_lazy == 1;
++}
++uint64_t page_up(uint64_t n) { return (n + 4095) & ~(uint64_t) 4095; }
++// pin `L` up to `cells` (whole pages, never past its context).  Each array stays ONE registration: a copy
++// (hipMemcpyAsync: the ring restore, a conversation's restore, the prompt staging) whose range spans two separate
++// registrations is refused with "invalid argument" on ROCm, though the kernels read across them.  So a growth
++// re-registers the array's whole prefix, on a quiet device (`quiet` once, before the first change), and the
++// caller grows in big steps (qsa_kv_host_ensure) so that happens a handful of times in a process's life.
++bool host_lazy_grow(HostLazy& L, int64_t cells, bool& quiet) {
++    const int64_t need = std::min<int64_t>(L.pages, (cells + L.page_cells - 1) / L.page_cells);
++    if (need <= L.done) return true;
++    for (size_t a = 0; a < L.off.size(); ++a) {
++        // (+256: a whole-block copy may read a little past its last cell, as the pinned copy's padding allowed)
++        const uint64_t want = std::min<uint64_t>(page_up(L.off[a] + (uint64_t) need * L.per_page[a] + 256),
++                                                 a + 1 < L.off.size() ? L.off[a + 1] : L.span);
++        if (want <= L.end[a]) continue;
++        if (L.end[a] > L.off[a]) {
++            if (!quiet) {
++                if (cudaDeviceSynchronize() != cudaSuccess) return false;
++                quiet = true;
++            }
++            if (cudaHostUnregister(L.base + L.off[a]) != cudaSuccess) {
++                std::fprintf(stderr, "strata: KV streaming: cannot unpin a layer's KV copy to grow it: %s\n",
++                             cudaGetErrorString(cudaGetLastError()));
++                return false;
++            }
++            g_kv_host_bytes -= L.end[a] - L.off[a];
++            L.end[a] = L.off[a];
++        }
++        if (cudaHostRegister(L.base + L.off[a], (size_t) (want - L.off[a]), cudaHostRegisterMapped | cudaHostRegisterPortable) !=
++            cudaSuccess) {
++            std::fprintf(stderr, "strata: KV streaming: cannot pin %.1f MiB of RAM for a layer's KV copy (%.2f GiB pinned "
++                                 "so far): %s\n", (double) (want - L.off[a]) / 1048576.0, (double) g_kv_host_bytes / 1073741824.0,
++                         cudaGetErrorString(cudaGetLastError()));
++            return false;
++        }
++        g_kv_host_bytes += want - L.off[a];
++        L.end[a] = want;
++    }
++    L.done = need;
++    return true;
++}
++
+ // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
+ bool g_kv_elastic = false;
+ int64_t g_kv_elastic_init = 16384;
+@@ -666,6 +734,21 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
+ int64_t qsa_kv_resident() { return g_kv_resident; }
+ int64_t qsa_kv_resident_min() { return 20480; }
+ uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
++bool qsa_kv_host_ensure(const QsaState& st, int64_t cells) {
++    if (st.host_lazy < 0) return true;
++    HostLazy& L = g_host_lazy[(size_t) st.host_lazy];
++    if (cells <= L.cells || L.done >= L.pages) return true;
++    // half as much again each time (whole steps): a few re-registrations in a state's life, at most a third unused
++    int64_t target = L.cells;
++    while (target < cells) target = (std::max(target * 3 / 2, target + g_kv_host_step) + g_kv_host_step - 1) / g_kv_host_step * g_kv_host_step;
++    bool quiet = false;
++    if (!host_lazy_grow(L, target, quiet)) return false;
++    L.cells = target;
++    if (std::getenv("STRATA_KV_HOST_LOG") != nullptr)
++        std::fprintf(stderr, "strata: KV host copy %d grown to %lld cells (%.2f GiB pinned in all)\n", st.host_lazy,
++                     (long long) target, (double) g_kv_host_bytes / 1073741824.0);
++    return true;
++}
+ 
+ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+     const QsaShapes s = qsa_shapes(g);
+@@ -803,7 +886,60 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+         uint8_t* h = nullptr;
+         uint8_t* d = nullptr;
+-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
++        // the lazy copy: the arrays' sizes per logical page, in the order the cursor below takes them
++        std::vector<uint64_t> per;
++        const uint64_t ksb = (uint64_t) s.n_head_kv * s.page_size;   // rows per page
++        if (st.kv_hybrid) per = {ksb * s.head_dim, ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, ksb * q4_row};
++        else if (st.kv_q4) per = {ksb * q4_row, ksb * q4_row};
++        else if (st.kv_int8) per = {ksb * s.head_dim, ksb * s.head_dim, ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2,
++                                    ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2};
++        else per = {ksb * s.head_dim * 2, ksb * s.head_dim * 2};
++        if (host_lazy_on()) {
++            HostLazy L;
++            L.pages = pages;
++            L.page_cells = s.page_size;
++            const uint64_t G = 2ull << 20;
++            for (const uint64_t b : per) {
++                L.off.push_back(L.span);
++                L.per_page.push_back(b);
++                L.end.push_back(L.span);
++                L.span += (b * (uint64_t) pages + 256 + G - 1) / G * G;
++            }
++            void* m = mmap(nullptr, (size_t) L.span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++            if (m != MAP_FAILED) {
++                L.base = (uint8_t*) m;
++                void* dp = nullptr;
++                bool quiet = false;
++                L.cells = std::max<int64_t>(g_kv_host_step, s.page_size);
++                bool same = host_lazy_grow(L, L.cells, quiet) &&
++                            cudaHostGetDevicePointer(&dp, L.base, 0) == cudaSuccess && dp == (void*) L.base;
++                if (same) {
++                    st.host = strata::kernels::KvHostPools{};
++                    uint8_t* a[4] = {};
++                    for (size_t i = 0; i < per.size(); ++i) a[i] = L.base + L.off[i];
++                    if (st.kv_hybrid) { st.host.k_q = (int8_t*) a[0]; st.host.k_scale = (uint16_t*) a[1]; st.host.v_q4 = a[2]; }
++                    else if (st.kv_q4) { st.host.k_q4 = a[0]; st.host.v_q4 = a[1]; }
++                    else if (st.kv_int8) {
++                        st.host.k_q = (int8_t*) a[0]; st.host.v_q = (int8_t*) a[1];
++                        st.host.k_scale = (uint16_t*) a[2]; st.host.v_scale = (uint16_t*) a[3];
++                    } else { st.host.k_pool = (uint16_t*) a[0]; st.host.v_pool = (uint16_t*) a[1]; }
++                    st.host_lazy = (int) g_host_lazy.size();
++                    g_host_lazy.push_back(std::move(L));
++                    per.clear();   // done: skip the pinned allocation below
++                } else {
++                    (void) cudaGetLastError();
++                    std::fprintf(stderr, "strata: KV streaming: the lazy host copy is not mapped at its own address "
++                                         "here; pinning the whole copy (STRATA_KV_HOST_LAZY=0 does so always)\n");
++                    for (size_t i = 0; i < L.off.size(); ++i)
++                        if (L.end[i] > L.off[i]) { cudaHostUnregister(L.base + L.off[i]); g_kv_host_bytes -= L.end[i] - L.off[i]; }
++                    munmap(L.base, (size_t) L.span);
++                    g_kv_host_lazy = 0;
++                }
++            }
++        }
++        if (per.empty()) {
++            // the lazy copy is in place
++        } else if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
+             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+@@ -812,6 +948,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+                                  (double) g_kv_host_bytes / 1073741824.0);
+             return 0;
+         }
++        if (!per.empty()) {
+         g_kv_host_bytes += bytes;
+         Cursor hc{d};
+         if (st.kv_hybrid) {
+@@ -830,6 +967,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+             st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
+             st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+         }
++        }
+     }
+     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
+     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
+diff --git a/src/core/session.cpp b/src/core/session.cpp
+index 8d1fad91..2e02c24e 100644
+--- a/src/core/session.cpp
++++ b/src/core/session.cpp
+@@ -129,6 +129,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
+     return used;
+ }
+ 
++bool session_kv_host_ensure(const SessionState& s, int64_t cells) {
++    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
++        if (!qsa_kv_host_ensure(s.qsa_states[s.qsa_ord0 + j], cells)) return false;
++    return true;
++}
++
+ void session_release(SessionState& s) {
+     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+         if (s.qsa_states[j].owns_rope) {
 diff --git a/src/core/verify.cpp b/src/core/verify.cpp
 index df61724f..734a7a04 100644
 --- a/src/core/verify.cpp
@@ -2008,7 +2359,7 @@ index 15078dbf..bcffa3bb 100644
                      if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                          cudaStreamSynchronize(m.cs);
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 4aa057db..75e1469e 100644
+index 4aa057db..8b2c9834 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -246,6 +246,330 @@ bool refill_blocking() {
@@ -2342,7 +2693,27 @@ index 4aa057db..75e1469e 100644
  using Clock = std::chrono::steady_clock;
  
  // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
-@@ -4696,6 +5020,31 @@ int main(int argc, char** argv) {
+@@ -4433,6 +4757,19 @@ int main(int argc, char** argv) {
+     // slots' draft-KV copies use this one too
+     static const strata::core::ModelGeometry draft_geometry{};
+     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
++    // the lazy host copies (qsa_kv_host_ensure): the main sessions and their drafter, or batch slot b's, pinned up to
++    // `cells` before anything writes or copies cells up to there
++    auto host_main = [&](int64_t cells) -> bool {
++        bool ok = strata::core::session_kv_host_ensure(ss, cells) && strata::core::qsa_kv_host_ensure(mtp.kv_state(), cells);
++        for (const auto& st : stages) ok = ok && strata::core::session_kv_host_ensure(st->ss, cells);
++        return ok;
++    };
++    auto host_slot = [&](int b, int64_t cells) -> bool {
++        bool ok = true;
++        for (const auto& v : bslot_ss) if ((size_t) b < v.size()) ok = ok && strata::core::session_kv_host_ensure(*v[(size_t) b], cells);
++        if ((size_t) b < slot_mtp.size() && slot_mtp[(size_t) b]) ok = ok && strata::core::qsa_kv_host_ensure(slot_mtp[(size_t) b]->kv_state(), cells);
++        return ok;
++    };
+     if (!o.mtp.empty()) {
+         if (o.spec < 2) {
+             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
+@@ -4696,6 +5033,31 @@ int main(int argc, char** argv) {
          } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
              src.set_io_stats(true);
          }
@@ -2374,7 +2745,7 @@ index 4aa057db..75e1469e 100644
          srcp = &src;
      } else {
          arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-@@ -7535,6 +7884,8 @@ int main(int argc, char** argv) {
+@@ -7535,6 +7897,8 @@ int main(int argc, char** argv) {
              for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
          }
          ver.set_remote_expert_opt(remote_opt.get());
@@ -2383,7 +2754,35 @@ index 4aa057db..75e1469e 100644
          if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
          if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
-@@ -8335,6 +8686,18 @@ int main(int argc, char** argv) {
+@@ -7725,6 +8089,11 @@ int main(int argc, char** argv) {
+         bool live_ok = false;
+         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
+         bool nan_flush = false;
++        // requests in a row that met non-finite logits.  The second one has read its prompt from token 0 with every
++        // cached state dropped, so the damage is in the weights the engine holds, not in a conversation: seen with the
++        // Q4_K_XL pack on the R9700 at about one start in ten (2026-10-16, cause not found; every request after it
++        // was non-finite until a restart).  The engine then stops, and the server starts it afresh.
++        int nf_streak = 0;
+         std::vector<ConvCheckpoint> checks;
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+@@ -7997,6 +8366,15 @@ int main(int argc, char** argv) {
+             std::fflush(stderr);
+             nf_hit = true;
+             nan_flush = true;
++            if (++nf_streak >= 2) {
++                std::fprintf(stderr, "strata serve: non-finite logits again after reading from token 0 (#879): the weights "
++                                     "in memory look damaged; the engine stops so that the server starts it afresh\n");
++                std::printf("ERR the model's weights in memory look damaged (non-finite logits twice in a row); the engine "
++                            "restarts\n");
++                std::fflush(stdout);
++                std::fflush(stderr);
++                std::_Exit(3);
++            }
+             return true;
+         };
+         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
+@@ -8335,6 +8713,18 @@ int main(int argc, char** argv) {
              aflipped = false;
              res_upload();
          };
@@ -2402,7 +2801,7 @@ index 4aa057db..75e1469e 100644
          // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
          std::function<void()> adapt_fence;
          // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-@@ -9106,6 +9469,7 @@ int main(int argc, char** argv) {
+@@ -9106,6 +9496,7 @@ int main(int argc, char** argv) {
                  return false;
              }
              if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
@@ -2410,25 +2809,93 @@ index 4aa057db..75e1469e 100644
              for (const PfPart& p : pf_parts)
                  if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
              if (!ver.wait_commit(e)) return false;
-@@ -9954,7 +10318,7 @@ int main(int argc, char** argv) {
+@@ -9244,6 +9635,7 @@ int main(int argc, char** argv) {
+         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
+         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+             const int64_t upto = (int64_t) ids.size();
++            if (!host_slot(b, upto + 256)) { e = "batch admission: the slot's KV copy cannot grow (no RAM can be pinned)"; return false; }
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+@@ -9285,6 +9677,7 @@ int main(int argc, char** argv) {
+         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
+         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
++            if (!host_main(upto + 256)) { e = "batch slot restore: the KV copy cannot grow (no RAM can be pinned)"; return false; }
+             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
+@@ -9360,6 +9753,12 @@ int main(int argc, char** argv) {
+             }
+             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+             if (S == 0) return true;
++            // the lazy host copies: each slot's window cells and its drafter's beyond them
++            for (int t = 0; t < A; ++t)
++                if (!host_slot(active[t], bs[(size_t) active[t]].p + strata::kernels::kVerifyMaxT + 64)) {
++                    err = "the KV copy cannot grow: no RAM can be pinned";
++                    return false;
++                }
+             const bool was_busy = strata::core::progress().busy.load();
+             strata::core::progress().busy.store(true);
+             drive.d.layers = 0;
+@@ -9575,6 +9974,11 @@ int main(int argc, char** argv) {
+         // one turn: serve every running stage, hand finished groups on, start what can start
+         auto pump = [&](bool may_start) -> bool {
+             ++pipe_tick;
++            for (size_t b = 0; b < bs.size(); ++b)   // the lazy host copies: each active slot's next window
++                if (bs[b].active && !host_slot((int) b, bs[b].p + strata::kernels::kVerifyMaxT + 64)) {
++                    err = "the KV copy cannot grow: no RAM can be pinned";
++                    return false;
++                }
+             if (bt_windows == 0 && !pipe_inflight()) {
+                 bt_start = Clock::now();
+                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+@@ -9953,8 +10357,13 @@ int main(int argc, char** argv) {
+                         refuse(err);
                          continue;
                      }
++                    if (!host_main((int64_t) image.live.ids.size() + 256)) {
++                        refuse("the KV copy cannot grow to the saved conversation: no RAM can be pinned",
++                               strata::core::SessionError::memory);
++                        continue;
++                    }
                      // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
 -                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
 +                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
                          refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                          continue;
                      }
-@@ -10211,7 +10575,7 @@ int main(int argc, char** argv) {
+@@ -10211,7 +10620,14 @@ int main(int argc, char** argv) {
                  std::printf("ERR %s\n", err.c_str());
                  return 1;
              }
 -            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
 +            auto kv_quiesce = [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); };
++            // the lazy host copy (qsa_kv_host_ensure): this prompt's cells, before a checkpoint, a slot or the prompt
++            // writes them
++            if (!host_main(n + 256)) {
++                std::printf("ERR the KV copy cannot grow to this prompt: no RAM can be pinned\n");
++                std::fflush(stdout);
++                continue;
++            }
              if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                  // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                  if (!kvg_ensure(n + 256, kv_quiesce)) {
-@@ -10714,6 +11078,21 @@ int main(int argc, char** argv) {
+@@ -10359,7 +10775,12 @@ int main(int argc, char** argv) {
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                 }
+             }
+-            // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
++            // the elastic K/V and the lazy host copy: a parked conversation is restored whole, and it may be longer
++            // than this prompt
++            if (incoming && !host_main((int64_t) incoming->live.ids.size() + 256)) {
++                std::printf("ERR the KV copy cannot grow to the parked conversation: no RAM can be pinned\n");
++                return 1;
++            }
+             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
+                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
+                 return 1;
+@@ -10714,6 +11135,21 @@ int main(int argc, char** argv) {
              auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                  tr("refill start", (long long) p.lent.size());
                  const strata::core::OnDevice on(p.dev);
@@ -2450,7 +2917,7 @@ index 4aa057db..75e1469e 100644
                  for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                      const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                      const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-@@ -10768,11 +11147,40 @@ int main(int argc, char** argv) {
+@@ -10768,11 +11204,40 @@ int main(int argc, char** argv) {
                  }
                  return true;
              };
@@ -2491,7 +2958,7 @@ index 4aa057db..75e1469e 100644
                  const auto t_ln = Clock::now();
                  // what this segment needs, capped by the configured chunk: a request lends only what its own
                  // prompt needs, so a large chunk costs a short prompt nothing
-@@ -11040,7 +11448,7 @@ int main(int argc, char** argv) {
+@@ -11040,7 +11505,7 @@ int main(int argc, char** argv) {
                  if (to <= at) continue;
                  err.clear();
                  const bool win = windows_ok(at, to);
@@ -2500,7 +2967,7 @@ index 4aa057db..75e1469e 100644
                      std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                      return 1;
                  }
-@@ -11090,7 +11498,7 @@ int main(int argc, char** argv) {
+@@ -11090,7 +11555,7 @@ int main(int argc, char** argv) {
                      std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                   (long long) message_at, (long long) (turn_at - message_at));
              }
@@ -2509,7 +2976,7 @@ index 4aa057db..75e1469e 100644
                  std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                  return 1;
              }
-@@ -11853,6 +12261,16 @@ int main(int argc, char** argv) {
+@@ -11853,6 +12318,16 @@ int main(int argc, char** argv) {
                  drive.d.layers = 0;
                  drive.d.experts = 0;
                  drive.d.failed = false;
@@ -2526,16 +2993,31 @@ index 4aa057db..75e1469e 100644
                  // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                  // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                  // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-@@ -11890,7 +12308,7 @@ int main(int argc, char** argv) {
+@@ -11888,9 +12363,13 @@ int main(int argc, char** argv) {
+                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+                                cudaMemcpyHostToDevice);
                  }
-                 // the elastic K/V: the window's cells and the drafter's beyond them
+-                // the elastic K/V: the window's cells and the drafter's beyond them
++                // the lazy host copy and the elastic K/V: the window's cells and the drafter's beyond them
++                if (!host_main(p + T + 64)) {
++                    std::printf("ERR the KV copy cannot grow: no RAM can be pinned\n");
++                    return 1;
++                }
                  if (kvg.on && p + T + 64 > kvg.cells &&
 -                    !kvg_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
 +                    !kvg_ensure(p + T + 64, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
                      std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                      return 1;
                  }
-@@ -12210,6 +12628,10 @@ int main(int argc, char** argv) {
+@@ -12202,6 +12681,7 @@ int main(int argc, char** argv) {
+                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
+                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
++            if (!nf_hit) nf_streak = 0;
+             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
+                         (long long) produced_n,
+                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
+@@ -12210,6 +12690,10 @@ int main(int argc, char** argv) {
                          (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                          (long long) req_offload, chain_txt);
              std::fflush(stdout);
@@ -2546,7 +3028,27 @@ index 4aa057db..75e1469e 100644
              if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                  bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                              (int64_t) live.size() == p;
-@@ -12492,7 +12914,14 @@ int main(int argc, char** argv) {
+@@ -12443,7 +12927,8 @@ int main(int argc, char** argv) {
+                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
+                 kvg_started = true;
+                 kvg_start(first);
+-                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
++                if (!host_main(n_prompt + o.max_new + 64) ||
++                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+                 for (size_t i = 0; i < host_res.size(); ++i)
+                     if (host_res[i] >= first) {
+                         lent.emplace_back((int32_t) i, host_res[i]);
+@@ -12482,7 +12967,8 @@ int main(int argc, char** argv) {
+         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
+             kvg_started = true;
+             kvg_start(xcache.slots());
+-            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
++            if (!host_main(n_prompt + o.max_new + 64) ||
++                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+         }
+         const Clock::time_point tp0 = Clock::now();
+         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
+@@ -12492,7 +12978,14 @@ int main(int argc, char** argv) {
          // refill the lent slots from the arena and give them back to the decode tier
          if (!lent.empty()) {
              const Clock::time_point tr = Clock::now();
@@ -2562,7 +3064,17 @@ index 4aa057db..75e1469e 100644
                  const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                  const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                  if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
-@@ -12798,6 +13227,8 @@ int main(int argc, char** argv) {
+@@ -12534,7 +13027,8 @@ int main(int argc, char** argv) {
+     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
+         kvg_started = true;
+         kvg_start(xcache.slots());
+-        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
++        if (!host_main(n_prompt + o.max_new + 64) ||
++                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+     }
+     for (int64_t pos = pos_start;; ++pos) {
+         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
+@@ -12798,6 +13292,8 @@ int main(int argc, char** argv) {
          vh.blob = thits.blob;
          vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
          vh.n_slots = xcache.slots();
@@ -2571,7 +3083,7 @@ index 4aa057db..75e1469e 100644
          if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
              std::fprintf(stderr, "strata generate: %s\n", err.c_str());
              return 1;
-@@ -13229,6 +13660,17 @@ int main(int argc, char** argv) {
+@@ -13229,6 +13725,17 @@ int main(int argc, char** argv) {
                              (unsigned long long) ic.pf_dropped, (double) ic.pread_bytes / 1e6,
                              (unsigned long long) ic.pread_n, ic.pread_n > 0 ? (double) ic.pread_us / 1e3 / (double) ic.pread_n : 0.0,
                              rounds > 0 ? (double) ic.crit_us / 1e3 / rounds : 0.0);

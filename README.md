@@ -11,8 +11,10 @@ integrated and discrete graphics (base commit `fb58e0d`) and on a desktop Radeon
 
 - **`strata-r9700.patch`**: the Radeon AI PRO R9700 (gfx1201). FP8 matrix-core kernels for a prompt's expert and dense
   products, the low-RAM mode carried forward to upstream `7695859a`, a RAM share for the experts a long prompt borrows
-  from the GPU cache, and fixes for GPU stalls. A 16K prompt reads at about 3,650 tokens/s with the experts in RAM
-  (Strata 0.1.41: about 1,500) and about 2,775 in a 28 GB setup that runs beside ComfyUI.
+  from the GPU cache, fixes for GPU stalls, and conversation memory that is pinned only as far as each conversation
+  reaches. A 16K prompt reads at about 3,650 tokens/s with the experts in RAM (Strata 0.1.41: about 1,500) and about
+  2,775 in a 28 GB setup that runs beside ComfyUI. The 4-bit UD-Q4_K_XL model runs at the full 262K context in about
+  43 GB, also beside ComfyUI.
 
 The first two apply to a clean `fb58e0d` checkout, alone or together; the 890M results for IQ3_S and for little memory
 below use both. The R9700 patch applies to `7695859a` on its own and already contains the low-RAM mode.
@@ -121,8 +123,9 @@ as any change of cache size does in Strata: lazy loading's spare memory, `--kv-g
 
 ## What the R9700 patch changes
 
-Everything is opt-in. `configs/strata-r9700-allram.json` (experts in RAM, about 55 GB) and `configs/strata-r9700-28g.json`
-(28 GB, 256K context) set it all.
+Everything is opt-in, except the conversation memory below. `configs/strata-r9700-allram.json` (experts in RAM, about
+55 GB), `configs/strata-r9700-28g.json` (28 GB, 256K context) and `configs/strata-r9700-q4.json` (the UD-Q4_K_XL model,
+262K context, about 43 GB) set it all.
 
 | Setting | What it does |
 | --- | --- |
@@ -134,9 +137,14 @@ Everything is opt-in. `configs/strata-r9700-allram.json` (experts in RAM, about 
 | `STRATA_WARMUP_TOKENS=4096` | The server reads one throwaway prompt at start. Without it, the first long prompt after a start sometimes read at a fifth of the speed. |
 | `STRATA_ARENA_MLOCK=1` | Locks the experts' RAM copy (needs a memory-lock limit, see below). |
 | Prompt ring | With `STRATA_HIP_WMMA=1`, prompts up to 8K keep 384 experts in flight instead of 96: 4K prompts about 12% faster. `STRATA_PREFILL_RING_SMALL`, `STRATA_PREFILL_RING_SMALL_MAX` set it. |
+| Conversation memory (on by default) | With `--kv-resident`, every attention layer keeps a copy of its conversation in pinned RAM. Upstream pins the full context for every layer of every session at start: 8.6 GB at 131K with `--batch 4`, mostly unused. Now each session's copy is reserved address space, pinned as its conversation grows (half as much again each time, from 8,192 tokens). A 240K conversation pins 3.8 GB; short ones a few hundred MB. `STRATA_KV_HOST_LAZY=0` pins everything up front as before; `STRATA_KV_HOST_STEP` sets the first step; `STRATA_KV_HOST_LOG=1` logs each growth. |
+| Self-restart on damaged weights | When two requests in a row produce non-finite logits, the second read from token 0 with every cached state dropped, the engine exits and the server starts it again on the next request. Upstream kept answering, and every answer after it was broken. |
+| `"default_max_tokens"` in a config's `"vision"` | An image whose part does not ask for detail `"high"` is shrunk to this many image tokens before encoding, so `"max_tokens"` is reached only on request. |
 
 Upstream switches the configs also set: `STRATA_HIP_WMMA=1 STRATA_SELECT_WMMA=1` (attention on the matrix cores),
 `STRATA_PF_FUSED=1` (the fused experts for every format; the SC117 model's 20 IQ2_S layers otherwise run on MMQ),
+`STRATA_PF_FUSED_KQ=1` in the Q4 config (the fused kernels for Q4_K and Q5_1 experts too: a 4K prompt's expert maths
+5.9 s -> 0.6 s on the R9700),
 `STRATA_ROUTE_RESIDENT=1` (about 3% faster code answers), `STRATA_UNBUFFERED_LOAD=1` and `HSA_USERPTR_FOR_PAGED_MEM=0`.
 
 **Output.** The FP8 and BF16 settings change the numbers. On 7 questions about a 20,000-token document, answered
@@ -404,6 +412,54 @@ Long context, 24 GB, 256K context (`--resident-budget-gib 14.5`: the K/V takes 3
 | Strata code answer, tokens/s | 82 | 82-94 |
 
 The lowest available RAM during the long clip was 15.1 GiB of 94.
+
+### Radeon AI PRO R9700, UD-Q4_K_XL, R9700 patch
+
+- **Model:** [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF),
+  `unsloth-UD-Q4_K_XL` (111 GB), packed with `tools/iq_pack.py --compat-bf16`, with the same MTP draft head. Images
+  use the base model's `mmproj-F16.gguf`.
+- **Setup:** `configs/strata-r9700-q4.json`: 262,144-token context, 8-bit K/V with 32,768 tokens on the GPU, a 30 GB
+  RAM share for the experts, 4 parallel slots. No memory cap; the engine's peak was 42.8 GB.
+- **Hardware and method:** as for IQ3_S above, on the running server. One run per row.
+
+| Prompt | Prompt, tokens/s | Writing, tokens/s |
+| --- | ---: | ---: |
+| 1K | 242 | 53.9 |
+| 4K | 736 | 54.8 |
+| 16K | 1,885 | 52.6 |
+| 32K | 1,849 | 54.3 |
+| 64K | 2,432 | 56.9 |
+| 128K | 2,178 | 53.4 |
+| 240K (242,574 tokens) | 2,212 | 50.1 |
+
+**Less RAM.** The conversation memory now grows with each conversation, and the RAM it no longer holds goes to the
+experts. 131K context, `STRATA_PF_FUSED_KQ=1`, under a memory cap:
+
+| RAM cap | Experts in RAM | Conversation memory | 4K | 16K | Peak |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 32 GB | 15 GiB | pinned up front (before) | 572 | 1,730 | 31.3 GB |
+| 32 GB | 20 GiB | grows | 644 | 1,876 | 28.5 GB |
+| 32 GB | 22 GiB | grows | 674 | 1,896 | 31.4 GB |
+
+At 20 GiB, a 96K prompt read at 1,923 tokens/s and the peak rose to 30.0 GB. Under a cap the share must leave room for
+the conversations to grow: a cap reached by the engine coincided with non-finite logits twice.
+
+**Beside ComfyUI** (MiniMax H3 on an RTX 3080, one part of a long clip):
+
+| | Alone | Both at once |
+| --- | ---: | ---: |
+| H3 part render | 768 s | 632 s |
+| 16K prompt, tokens/s | 1,885 | 1,852 |
+| 240K prompt, tokens/s | 2,212 | 2,148 |
+| Writing, tokens/s | 50-57 | 49-55 |
+
+The lowest available RAM was 26 GB of 94, with no swapping. Under a 28 GB cap with a 17 GiB share and 131K context it
+also ran beside a render: 4K 578, 16K 1,728, 64K 2,150 tokens/s.
+
+**Known issue.** About one start in ten, the first long prompt with this model gave non-finite logits, and every
+request after it did too until a restart. It was seen with and without the conversation-memory change, never in 12
+attempts to cause it (busy drive, a render starting, `STRATA_PF_FUSED_KQ` on and off), and never with IQ3_S. The cause
+is not known; the self-restart above limits it to one failed request.
 
 ## License
 
