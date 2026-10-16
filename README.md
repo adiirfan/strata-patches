@@ -125,7 +125,7 @@ as any change of cache size does in Strata: lazy loading's spare memory, `--kv-g
 
 Everything is opt-in, except the conversation memory below. `configs/strata-r9700-allram.json` (experts in RAM, about
 55 GB), `configs/strata-r9700-28g.json` (28 GB, 256K context) and `configs/strata-r9700-q4.json` (the UD-Q4_K_XL model,
-262K context, about 43 GB) set it all.
+262K context, 2 slots, about 22-25 GB, for a hard 28 GB limit) set it all.
 
 | Setting | What it does |
 | --- | --- |
@@ -138,6 +138,7 @@ Everything is opt-in, except the conversation memory below. `configs/strata-r970
 | `STRATA_ARENA_MLOCK=1` | Locks the experts' RAM copy (needs a memory-lock limit, see below). |
 | Prompt ring | With `STRATA_HIP_WMMA=1`, prompts up to 8K keep 384 experts in flight instead of 96: 4K prompts about 12% faster. `STRATA_PREFILL_RING_SMALL`, `STRATA_PREFILL_RING_SMALL_MAX` set it. |
 | Conversation memory (on by default) | With `--kv-resident`, every attention layer keeps a copy of its conversation in pinned RAM. Upstream pins the full context for every layer of every session at start: 8.6 GB at 131K with `--batch 4`, mostly unused. Now each session's copy is reserved address space, pinned as its conversation grows (half as much again each time, from 8,192 tokens). A 240K conversation pins 3.8 GB; short ones a few hundred MB. `STRATA_KV_HOST_LAZY=0` pins everything up front as before; `STRATA_KV_HOST_STEP` sets the first step; `STRATA_KV_HOST_LOG=1` logs each growth. |
+| Memory limit for the conversation memory | Under a memory limit (the engine's cgroup `memory.max`, else `STRATA_MEMORY_LIMIT_MIB`), a conversation copy grows only while that leaves `STRATA_KV_HOST_FLOOR_MIB` (1024) free, file cache not counted. Otherwise a request that needs more is refused, and an answer that needs more ends at its length. Pinning past the limit is not refused by the system: the engine is killed. |
 | Self-restart on damaged weights | When two requests in a row produce non-finite logits, the second read from token 0 with every cached state dropped, the engine exits and the server starts it again on the next request. Upstream kept answering, and every answer after it was broken. |
 | `"default_max_tokens"` in a config's `"vision"` | An image whose part does not ask for detail `"high"` is shrunk to this many image tokens before encoding, so `"max_tokens"` is reached only on request. |
 
@@ -418,8 +419,9 @@ The lowest available RAM during the long clip was 15.1 GiB of 94.
 - **Model:** [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF),
   `unsloth-UD-Q4_K_XL` (111 GB), packed with `tools/iq_pack.py --compat-bf16`, with the same MTP draft head. Images
   use the base model's `mmproj-F16.gguf`.
-- **Setup:** `configs/strata-r9700-q4.json`: 262,144-token context, 8-bit K/V with 32,768 tokens on the GPU, a 30 GB
-  RAM share for the experts, 4 parallel slots. No memory cap; the engine's peak was 42.8 GB.
+- **Setup:** 262,144-token context, 8-bit K/V with 32,768 tokens on the GPU. The table below: a 30 GiB RAM share for
+  the experts, 4 parallel slots, no memory cap; the engine's peak was 42.8 GB. `configs/strata-r9700-q4.json` is the
+  28 GB setup further down.
 - **Hardware and method:** as for IQ3_S above, on the running server. One run per row.
 
 | Prompt | Prompt, tokens/s | Writing, tokens/s |
@@ -455,6 +457,22 @@ the conversations to grow: a cap reached by the engine coincided with non-finite
 
 The lowest available RAM was 26 GB of 94, with no swapping. Under a 28 GB cap with a 17 GiB share and 131K context it
 also ran beside a render: 4K 578, 16K 1,728, 64K 2,150 tokens/s.
+
+**A hard 28 GB limit** (`configs/strata-r9700-q4.json`: a 13 GiB RAM share; the server in a systemd scope with
+`MemoryMax=28G`, `MemoryHigh=26G` and no swap), 262K context, beside an H3 render:
+
+| | Result |
+| --- | ---: |
+| 16K prompt, tokens/s | 1,647 |
+| 240K prompt, tokens/s | 1,917 |
+| Writing, tokens/s | about 43 |
+| Highest RAM | 24.5 GB |
+| H3 part render | 761 s (768 alone) |
+
+That run had 4 slots; the config has 2, which gives the GPU's expert cache about 2 GB more and uses a little less RAM
+(21.7 GB after a 5,000-token answer). Keep the engine clear of the limit itself: every time it reached a hard limit in
+these tests (at start-up under a 22 GB cap, or pinning the full context up front under 32 GB), its output came out
+non-finite. `MemoryHigh` a little below `MemoryMax` has the kernel drop the scope's file cache first.
 
 **Known issue.** About one start in ten, the first long prompt with this model gave non-finite logits, and every
 request after it did too until a restart. It was seen with and without the conversation-memory change, never in 12

@@ -32,7 +32,7 @@
   "--prompt-cache-every",
   "0",
   "--resident-budget-gib",
-  "30",
+  "13",
   "--batch-mtp"
  ],
  "cwd": ".",
@@ -80,7 +80,7 @@
   "max_tokens": 300,
   "threads": 6
  },
- "parallel": 4,
+ "parallel": 2,
  "fit_max_tokens": true,
  "sampling": {
   "temperature": 1.0,
