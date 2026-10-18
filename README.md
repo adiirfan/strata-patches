@@ -41,6 +41,7 @@ Speeds in tokens per second. "Prompt" is how fast a prompt is read, "Writing" ho
 | RTX 5080 Laptop | Low RAM | IQ3_S | 8 GB | 80 W card limit | 1,221 (16K) | 33.5 |
 | RTX 5080 Laptop | Low power | IQ3_S | 32 GB | 55 W card limit, 70 W charger | 727 (16K) | 25.6 |
 | Radeon AI PRO R9700 | Full memory | IQ3_S | ~55 GB | 230 W card limit | 3,600-3,680 (16K) | 60-71 |
+| Radeon AI PRO R9700 | Full memory | UD-Q4_K_XL | 64 GiB share, 76.4 GiB peak | 230 W card limit | 2,933 (16K) | 55.5 |
 | Radeon AI PRO R9700 | Low memory | UD-Q4_K_XL | 30 GiB share, ~43 GB peak | 230 W card limit | 1,885 (16K) | 52.6 |
 | Radeon AI PRO R9700 | Low memory | IQ3_S | 24 GB | 230 W card limit | 2,686-2,722 (16K) | 60-71 |
 | Radeon AI PRO R9700 | Low memory | UD-Q4_K_XL | 28 GB hard limit | 230 W card limit | 1,511 (16K) | 50.1 |
@@ -287,6 +288,21 @@ of RAM, 8-bit K/V, screen off.
 
 A 1,024-token code answer writes at about 100 tokens/s. Before the patch (Strata 0.1.41, experts in RAM, 77 GB), a 32K
 prompt read at 1,515 tokens/s.
+
+**UD-Q4_K_XL with a 50 or 64 GiB RAM share for the experts** (`--resident-budget-gib 50` or `64`). The model is
+111 GB, so on a 96 GB machine part of it is still read from the SSD. 262,144-token context, 8-bit K/V with 32,768 tokens
+on the card, 32K prompt chunks, `STRATA_BUDGET_LEND_GIB=7`, `STRATA_PF_FUSED_KQ=1`. The engine's peak was 66.6 GiB
+with the 50 GiB share and 76.4 GiB with 64 GiB. One run per size, so writing moves by a few tokens/s between rows.
+
+| Prompt size | 50 GiB: prompt | 50 GiB: writing | 64 GiB: prompt | 64 GiB: writing |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K | 364 | 43.0 | 428 | 45.9 |
+| 4K | 1,241 | 58.9 | 1,486 | 57.8 |
+| 16K | 2,491 | 60.3 | 2,933 | 55.5 |
+| 32K | 2,222 | 56.7 | 2,501 | 59.7 |
+| 64K | 2,805 | 57.8 | 2,959 | 56.2 |
+| 128K | 2,554 | 54.0 | 2,631 | 57.7 |
+| 240K (242,574 tokens) | 2,500 | 50.5 | 2,550 | 56.9 |
 
 ## Radeon AI PRO R9700: low memory
 
