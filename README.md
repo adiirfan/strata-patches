@@ -15,13 +15,10 @@ The first two can be used alone or together. The 890M results for IQ3_S and for 
 ## Contents
 
 - [Results at a glance](#results-at-a-glance)
-- [Radeon 890M: full run](#radeon-890m-full-run)
-- [Radeon 890M: small memory and low power](#radeon-890m-small-memory-and-low-power)
-- [RTX 5080 Laptop: full run](#rtx-5080-laptop-full-run)
-- [RTX 5080 Laptop: low RAM](#rtx-5080-laptop-low-ram)
-- [RTX 5080 Laptop: low power](#rtx-5080-laptop-low-power)
-- [Radeon AI PRO R9700: full memory](#radeon-ai-pro-r9700-full-memory)
-- [Radeon AI PRO R9700: low memory](#radeon-ai-pro-r9700-low-memory)
+- [How these were measured](#how-these-were-measured)
+- [Radeon 890M](#radeon-890m)
+- [RTX 5080 Laptop](#rtx-5080-laptop)
+- [Radeon AI PRO R9700](#radeon-ai-pro-r9700)
 - [Apply](#apply)
 - [What the 890M patch changes](#what-the-890m-patch-changes)
 - [What the low-RAM patch changes](#what-the-low-ram-patch-changes)
@@ -29,68 +26,80 @@ The first two can be used alone or together. The 890M results for IQ3_S and for 
 
 ## Results at a glance
 
-Speeds in tokens per second. "Prompt" is how fast a prompt is read, "Writing" how fast the answer comes out.
+Tokens per second. **Prompt** is reading a 16K-token prompt, **Writing** a 256-token story after it, unless marked.
+Every prompt size and setting is in each machine's section.
 
-| Machine | Run | Model | Memory used | Power | Prompt | Writing |
-| --- | --- | --- | --- | --- | ---: | ---: |
-| Radeon 890M | Full | Q2_0 | ~40 GB | – | 607 (16K) | 22.1 |
-| Radeon 890M | Full | IQ3_S | 48 GB graphics share | – | 531 (16K) | 13.6 |
-| Radeon 890M | Small memory | Q2_0 | ~13 GB | 240 W charger | 490 (6K) | 12.1 |
-| Radeon 890M | Low power | IQ3_S | ~19 GB | 70 W charger, 35 W package | – | 11.7 (code) |
-| RTX 5080 Laptop | Full | IQ3_S | ~52 GB | 80 W card limit | 1,468 (16K) | 53.0 |
-| RTX 5080 Laptop | Low RAM | IQ3_S | 8 GB | 80 W card limit | 1,221 (16K) | 33.5 |
-| RTX 5080 Laptop | Low power | IQ3_S | 32 GB | 55 W card limit, 70 W charger | 727 (16K) | 25.6 |
-| Radeon AI PRO R9700 | Full memory | IQ3_S | ~55 GB | 230 W card limit | 3,600-3,680 (16K) | 60-71 |
-| Radeon AI PRO R9700 | Full memory | UD-Q4_K_XL | 64 GiB share, 76.4 GiB peak | 230 W card limit | 2,933 (16K) | 55.5 |
-| Radeon AI PRO R9700 | Low memory | UD-Q4_K_XL | 30 GiB share, ~43 GB peak | 230 W card limit | 1,885 (16K) | 52.6 |
-| Radeon AI PRO R9700 | Low memory | IQ3_S | 24 GB | 230 W card limit | 2,686-2,722 (16K) | 60-71 |
-| Radeon AI PRO R9700 | Low memory | UD-Q4_K_XL | 28 GB hard limit | 230 W card limit | 1,511 (16K) | 50.1 |
+| Machine | Model | Setup | Memory used | Prompt | Writing |
+| --- | --- | --- | --- | ---: | ---: |
+| Radeon 890M | Q2_0 | Every expert in graphics memory | ~40 GB | 607 | 22.1 |
+| Radeon 890M | IQ3_S | 73% of experts in graphics memory | 48 GB graphics share | 531 | 13.6 |
+| Radeon 890M | Q2_0 | Small memory | ~13 GB | 490 ¹ | 12.1 |
+| Radeon 890M | IQ3_S | Low power, 70 W charger | ~19 GB | – | 11.7 ² |
+| RTX 5080 Laptop | IQ3_S | Every expert in RAM | ~52 GB | 1,468 | 53.0 |
+| RTX 5080 Laptop | IQ3_S | Low RAM | 8 GB | 1,221 | 33.5 |
+| RTX 5080 Laptop | IQ3_S | Low power, 70 W charger | 32 GB | 727 | 25.6 |
+| Radeon AI PRO R9700 | IQ3_S | Every expert in RAM | ~55 GB | 3,600-3,680 | 60-71 |
+| Radeon AI PRO R9700 | IQ3_S | Low memory | 24 GB | 2,686-2,722 | 60-71 |
+| Radeon AI PRO R9700 | UD-Q4_K_XL | 64 GiB expert share | 82.0 GB peak | 2,933 | 55.5 |
+| Radeon AI PRO R9700 | UD-Q4_K_XL | 30 GiB expert share | ~43 GB peak | 1,885 | 52.6 |
+| Radeon AI PRO R9700 | UD-Q4_K_XL | Hard 28 GB limit | 28 GB | 1,511 | 50.1 |
 
-### How these were measured
+¹ A 6K-token prompt. ² A 1,024-token code answer.
+
+Power: the 890M on the laptop's 240 W charger, the RTX 5080 at its 80 W card limit, the R9700 at a 230 W limit
+(default 300 W), unless marked.
+
+## How these were measured
 
 - **Server:** Strata's OpenAI-compatible server. For each size, one fresh prompt (a unique first line, then plain
   text), then a 256-token story.
 - **Code answer:** a 1,024-token Python answer at temperature 0.
 - **Noise:** one run per row unless a range is shown, so expect a few percent either way.
-- **Memory caps:** a cgroup limit on the whole server, file cache included, with swap off.
+- **Memory limits:** a cgroup limit on the whole server, file cache included, with swap off.
 
 **Models:**
 - [SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF),
   Q2_0 or IQ3_S, with its MTP draft head.
+- [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF),
+  IQ1_M ("Coder"). Code answers on the RTX 5080 only.
 - [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF),
   `unsloth-UD-Q4_K_XL` (111 GB), packed with `tools/iq_pack.py --compat-bf16`, with the same draft head. Images use
   the base model's `mmproj-F16.gguf`. R9700 only.
 
-**Laptop** (890M and RTX 5080 runs):
+**Laptop** (890M and RTX 5080):
 - AMD Ryzen AI 9 HX 370 with Radeon 890M, 64 GB RAM.
 - NVIDIA GeForce RTX 5080 Laptop GPU, 16 GB.
 - Two SSDs: Samsung MZVL21T0HDLU (PCIe 4.0 x2, about 3.6 GB/s) and Micron 2500 2 TB (PCIe 4.0 x4); about 7.1 GB/s
   together.
 - Nobara Linux 44, kernel 7.2, NVIDIA driver 595.99, CUDA 13.3, ROCm 10.2 (TheRock).
 
-**Desktop** (R9700 runs):
+**Desktop** (R9700):
 - AMD Ryzen 5 7500F (6 cores), 96 GB DDR5-5600.
 - Radeon AI PRO R9700 32 GB at a 230 W power limit (default 300 W).
 - Patriot Viper VP4300L 2 TB (about 3.55 GB/s).
 - Debian 13, kernel 7.1.8, ROCm 10.2.0a20261009 (TheRock).
 
-## Radeon 890M: full run
+## Radeon 890M
 
-The whole model sits in the 890M's share of RAM (48 GB set aside for graphics, see [system settings](#what-the-890m-patch-changes)).
+### Full run
 
-**Q2_0, all 24,576 experts in graphics memory.** `strata-gfx1150-890m.patch`.
+The model in the 890M's share of RAM (48 GB set aside for graphics, see [system settings](#what-the-890m-patch-changes)).
 
-| Context | Prompt | Writing |
-| ---: | ---: | ---: |
-| 8K | 566 | 21.0 |
-| 16K | 607 | 22.1 |
-| 32K | 573 | 18.9 |
-| 64K | 578 | 20.5 |
-| 128K | 554 | 18.8 |
-| 254K | 494 | 18.7 |
+- **Q2_0:** all 24,576 experts in graphics memory. `strata-gfx1150-890m.patch`.
+- **IQ3_S:** its experts (50 GB) don't fit the 48 GB, so about 73% sit in graphics memory and the rest come from the
+  SSDs. Both patches, `configs/strata-890m-iq3s.json`, 262K context, second-drive copy.
 
-Strata's own community benchmark script (`bench/results/2026-09-30-community-rtx-5090/benchmark.py`, unchanged),
-median:
+| Context | Q2_0: prompt | Q2_0: writing | IQ3_S: prompt | IQ3_S: writing |
+| ---: | ---: | ---: | ---: | ---: |
+| 8K | 566 | 21.0 | 447 | 14.0 |
+| 16K | 607 | 22.1 | 531 | 13.6 |
+| 32K | 573 | 18.9 | 508 | 14.4 |
+| 64K | 578 | 20.5 | 520 | 13.4 |
+| 128K | 554 | 18.8 | 497 | 13.9 |
+| Longest (Q2_0 254K, IQ3_S 249K) | 494 | 18.7 | 452 | 13.0 |
+
+Q2_0 with Strata's own community benchmark script (`bench/results/2026-09-30-community-rtx-5090/benchmark.py`,
+unchanged), median:
 
 | Prompt tokens | Prompt | Writing |
 | ---: | ---: | ---: |
@@ -99,29 +108,17 @@ median:
 | 128,000 | 520.4 | 23.41 |
 | 260,000 | 468.1 | 22.69 |
 
-Before the patch (stock Fedora ROCm 7.1 build), a 6K-token prompt read at 130 tokens/s and a story wrote at 15.6.
-With it, about 580 and 25.
+**Before the patches:**
+- Q2_0 (stock Fedora ROCm 7.1 build): a 6K-token prompt read at 130 tokens/s and a story wrote at 15.6. With the
+  patch, about 580 and 25.
+- IQ3_S with the 890M patch alone: 8K read at 234 tokens/s and 32K at 125, writing 9.5-11.
 
-**IQ3_S, both patches.** IQ3_S's experts (50 GB) don't fit the 48 GB, so about 73% sit in graphics memory and the
-rest come from the SSDs. `configs/strata-890m-iq3s.json`, 262K context, second-drive copy.
-
-| Context | Prompt | Writing |
-| ---: | ---: | ---: |
-| 8K | 447 | 14.0 |
-| 16K | 531 | 13.6 |
-| 32K | 508 | 14.4 |
-| 64K | 520 | 13.4 |
-| 128K | 497 | 13.9 |
-| 249K | 452 | 13.0 |
-
-With the 890M patch alone, the same server read 8K at 234 tokens/s and 32K at 125, and wrote at 9.5-11.
-
-## Radeon 890M: small memory and low power
+### Small memory
 
 How small the expert cache can go and still be usable, for example on battery. The experts that don't fit are read
 from the SSDs.
 
-**Setup:**
+**Settings:**
 - `configs/strata-890m-q2_0-lowram.json` (Q2_0) or `configs/strata-890m-iq3s.json` (IQ3_S), with the
   `--expert-cache` shown.
 - 32K context, 8-bit K/V, second-drive copy (`--share 0.9`).
@@ -141,10 +138,10 @@ doesn't count towards the 4 GB cap, so the cap alone would understate it.
 | ~9 GB | 1,100 | 367 | 9.6 | 11.1 |
 | ~13 GB | 4,200 | 490 | 12.1 | 15.1 |
 | ~21 GB | 10,400 | 536 | 13.9 | 20.1 |
-| ~29 GB* | 16,500 | 571 | 17.5 | – |
+| ~29 GB ³ | 16,500 | 571 | 17.5 | – |
 | ~40 GB | 24,576 (all) | ~580 | 24.9 | 31.8 |
 
-\* Estimated from the cache size, not measured.
+³ Estimated from the cache size, not measured.
 
 **IQ3_S** (its experts vary in size, so a cache of N holds about 30% more than N experts):
 
@@ -164,8 +161,9 @@ doesn't count towards the 4 GB cap, so the cap alone would understate it.
 - **Above about 20 GB, prompts gain little** (8-15% up to the full model). Writing keeps improving and jumps once
   every expert fits.
 
-**Low power: 70 W USB-C charger.** The same code answer, with the processor package's power (CPU and 890M together)
-averaged while it wrote:
+### Low power: 70 W USB-C charger
+
+The same code answer, with the processor package's power (CPU and 890M together) averaged while it wrote:
 
 | Model, memory used | Code answer | Package power | Energy per token |
 | --- | ---: | ---: | ---: |
@@ -180,10 +178,14 @@ averaged while it wrote:
 - **Let the discrete GPU switch off.** Kept awake but idle, the RTX 5080 drew about 18 W.
 - These figures come from the processor, not the battery, so they don't show whether the battery was charging.
 
-## RTX 5080 Laptop: full run
+## RTX 5080 Laptop
 
-Every expert copied into RAM (about 52 GB), Strata's normal mode. IQ3_S, 8-bit K/V (up to 163,840 tokens), card at
-its 80 W limit. The 8K row is the first request after start-up.
+IQ3_S, 8-bit K/V (up to 163,840 tokens), the card at its 80 W limit unless marked. The 8K rows are the first
+request after start-up.
+
+### Full run
+
+Every expert copied into RAM (about 52 GB), Strata's normal mode.
 
 | Context | Prompt | Writing |
 | ---: | ---: | ---: |
@@ -197,11 +199,10 @@ its 80 W limit. The 8K row is the first request after start-up.
 The 8-bit K/V stops at about 160K tokens on a 16 GB card. Beyond that it no longer fits beside the experts a prompt
 borrows.
 
-## RTX 5080 Laptop: low RAM
+### Low RAM
 
 The low-RAM patch, `tools/rtx5080/strata-5080-lowram-iq3s.json`, with `STRATA_STAGE_KEEP` sized to each cap (2600,
-6300, 10300, 14300, 18300). IQ3_S, 8-bit K/V, card at its 80 W limit, both SSDs. The 8K row is the first request after
-start-up, with the RAM cache still cold.
+6300, 10300, 14300, 18300) and both SSDs. The 8K row ran with the RAM cache still cold.
 
 **Prompt:**
 
@@ -225,14 +226,14 @@ start-up, with the RAM cache still cold.
 | 128K | 27.1 | 36.6 | 43.5 | 49.3 | 52.1 |
 | 151K | 28.4 | 37.2 | 46.5 | 48.7 | 49.7 |
 
-At 32-40 GB the low-RAM mode is about as fast as the [full run](#rtx-5080-laptop-full-run): prompts within a few
-percent either way (except the cold 8K row), writing as fast or faster from 16K on. At 8 GB it still writes about
-30 tokens/s.
+- **At 32-40 GB the low-RAM mode is about as fast as the [full run](#full-run-1):** prompts within a few percent either
+  way (except the cold 8K row), writing as fast or faster from 16K on.
+- **At 8 GB it still writes about 30 tokens/s.**
 
-## RTX 5080 Laptop: low power
+### Low power
 
-The fastest settings found that keep the battery charging while the server works. IQ3_S with the low-RAM patch, 32 GB
-of RAM, 8-bit K/V, screen off.
+The fastest settings found that keep the battery charging while the server works: the low-RAM patch, 32 GB of RAM,
+screen off.
 
 **Settings:**
 - **Power saver with the processor's turbo off** (power saver alone leaves it on):
@@ -246,27 +247,17 @@ of RAM, 8-bit K/V, screen off.
 - **70 W charger only:** card core capped at 525 MHz, `sudo nvidia-smi -lgc 210,525`.
 - `STRATA_POOL_SPIN_US=0`, as in the example config.
 
-**100 W charger** (20 V × 5 A):
+| Request | 100 W: prompt | 100 W: writing | 100 W: battery | 70 W: prompt | 70 W: writing | 70 W: battery |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Code answer | – | 45.5 | +0.5 W | – | 31.0 | +0.1 W |
+| 8K | – | – | – | 636 | 22.5 | ±0 W |
+| 16K | 1,234 | 40.8 | +4.7 W | 727 | 25.6 | +2.6 W |
+| 32K | 1,132 | 41.1 | +10.3 W | 687 | 26.9 | +1.3 W |
+| 64K | 1,238 | 39.6 | +7.6 W | 719 | 26.7 | +1.3 W |
+| 128K | – | – | – | 678 | 22.9 | +1.6 W |
+| 151K | – | – | – | 671 | 25.1 | ±0 W |
 
-| Request | Prompt | Writing | Battery |
-| --- | ---: | ---: | ---: |
-| Code answer | – | 45.5 | +0.5 W |
-| 16K | 1,234 | 40.8 | +4.7 W |
-| 32K | 1,132 | 41.1 | +10.3 W |
-| 64K | 1,238 | 39.6 | +7.6 W |
-
-**70 W charger** (20 V × 3.5 A):
-
-| Request | Prompt | Writing | Battery |
-| --- | ---: | ---: | ---: |
-| Code answer | – | 31.0 | +0.1 W |
-| 8K | 636 | 22.5 | ±0 W |
-| 16K | 727 | 25.6 | +2.6 W |
-| 32K | 687 | 26.9 | +1.3 W |
-| 64K | 719 | 26.7 | +1.3 W |
-| 128K | 678 | 22.9 | +1.6 W |
-| 151K | 671 | 25.1 | ±0 W |
-
+- **Chargers:** 100 W is 20 V × 5 A, 70 W is 20 V × 3.5 A.
 - **Battery** is how fast the battery's charge counter rose (+) over each request. A full battery can't be read, so
   these runs started below full.
 - **On power saver the processor varies from run to run**, so writing can come out lower (down to about half) at the
@@ -274,9 +265,28 @@ of RAM, 8-bit K/V, screen off.
 - **Stopping the server mid-answer** has left the card at full clock (about 55 W) with nothing running on it. Check
   `nvidia-smi` after a stop.
 
-## Radeon AI PRO R9700: full memory
+### Code answers: three models
 
-`strata-r9700.patch`, card at a 230 W limit, after the server's start-up warm-up.
+15 short Python tasks (two_sum, longest_palindrome, valid_brackets, merge_intervals, LRUCache, top_k_words,
+roman_to_int, rotate, evaluate, topo_sort, rle, shortest_path, search_insert, flatten, spiral). Each answer is
+written at temperature 0 with thinking off, then run against fixed checks. **Writing** is the engine's own writing
+speed for each answer, averaged over the 15.
+
+| Model | Setup | Passed | Tokens written | Total time | Writing |
+| --- | --- | ---: | ---: | ---: | ---: |
+| IQ3_S | the everyday service, 32 GB | 15 / 15 | 2,685 | 109 s | 33.5 |
+| Q2_0 | 16 GB limit | 15 / 15 | 2,376 | 93 s | 37.1 |
+| Coder (IQ1_M) | 16 GB limit | 15 / 15 | 2,676 | 93 s | 40.0 |
+
+- **16 GB limit:** `MemoryMax=16G` with swap off, card core held at 1,000 MHz and its memory at 9,001 MHz, the
+  processor's turbo off and its power limits at 35 W, 16 CPU threads.
+- **Not a like-for-like speed test:** IQ3_S ran on the everyday service, not under the 16 GB settings.
+
+## Radeon AI PRO R9700
+
+`strata-r9700.patch`, card at a 230 W limit, after the server's start-up warm-up. Writing comes after each prompt.
+
+### Full memory
 
 **IQ3_S, every expert in RAM** (`configs/strata-r9700-allram.json`, about 55 GB):
 
@@ -286,13 +296,10 @@ of RAM, 8-bit K/V, screen off.
 | 16K | 3,600-3,680 | 60-71 |
 | 32K | 3,300-3,750 | 60-71 |
 
-A 1,024-token code answer writes at about 100 tokens/s. Before the patch (Strata 0.1.41, experts in RAM, 77 GB), a 32K
-prompt read at 1,515 tokens/s.
+- A 1,024-token code answer writes at about 100 tokens/s.
+- **Before the patch** (Strata 0.1.41, experts in RAM, 77 GB), a 32K prompt read at 1,515 tokens/s.
 
-**UD-Q4_K_XL with a 50 or 64 GiB RAM share for the experts** (`--resident-budget-gib 50` or `64`). The model is
-111 GB, so on a 96 GB machine part of it is still read from the SSD. 262,144-token context, 8-bit K/V with 32,768 tokens
-on the card, 32K prompt chunks, `STRATA_BUDGET_LEND_GIB=7`, `STRATA_PF_FUSED_KQ=1`. The engine's peak was 66.6 GiB
-with the 50 GiB share and 76.4 GiB with 64 GiB. One run per size, so writing moves by a few tokens/s between rows.
+**UD-Q4_K_XL with a 50 or 64 GiB RAM share for the experts** (`--resident-budget-gib 50` or `64`):
 
 | Prompt size | 50 GiB: prompt | 50 GiB: writing | 64 GiB: prompt | 64 GiB: writing |
 | ---: | ---: | ---: | ---: | ---: |
@@ -304,7 +311,13 @@ with the 50 GiB share and 76.4 GiB with 64 GiB. One run per size, so writing mov
 | 128K | 2,554 | 54.0 | 2,631 | 57.7 |
 | 240K (242,574 tokens) | 2,500 | 50.5 | 2,550 | 56.9 |
 
-## Radeon AI PRO R9700: low memory
+- **Settings:** 262,144-token context, 8-bit K/V with 32,768 tokens on the card, 32K prompt chunks,
+  `STRATA_BUDGET_LEND_GIB=7`, `STRATA_PF_FUSED_KQ=1`.
+- **Peak memory:** 71.5 GB with the 50 GiB share, 82.0 GB with 64 GiB. The model is 111 GB, so on a 96 GB machine part
+  of it is still read from the SSD.
+- One run per size, so writing moves by a few tokens/s between rows.
+
+### Low memory
 
 The same card and limit, with the experts that don't fit read from the SSD.
 
@@ -327,24 +340,29 @@ Writing after each prompt: 60-71 tokens/s in every setup. A code answer: 82-94 t
 | 128K | 2,784 | 61.0 |
 | 240K (242,537 tokens) | 2,736 | 59.6 |
 
-**UD-Q4_K_XL with a 30 GiB RAM share for the experts**, no memory cap. The model is 111 GB, so on a 96 GB machine part of
-it is always read from the SSD. 262,144-token context, 8-bit K/V with 32,768 tokens on the card,
-4 parallel slots. The engine's peak was 42.8 GB.
+**UD-Q4_K_XL:**
 
-| Prompt size | Prompt | Writing |
-| ---: | ---: | ---: |
-| 1K | 242 | 53.9 |
-| 4K | 736 | 54.8 |
-| 16K | 1,885 | 52.6 |
-| 32K | 1,849 | 54.3 |
-| 64K | 2,432 | 56.9 |
-| 128K | 2,178 | 53.4 |
-| 240K (242,574 tokens) | 2,212 | 50.1 |
+| Prompt size | 30 GiB share: prompt | 30 GiB share: writing | 28 GB limit: prompt | 28 GB limit: writing |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K | 242 | 53.9 | 153 | 31.4 |
+| 4K | 736 | 54.8 | 455 | 48.1 |
+| 16K | 1,885 | 52.6 | 1,511 | 50.1 |
+| 32K | 1,849 | 54.3 | – | – |
+| 64K | 2,432 | 56.9 | 2,128 | 51.2 |
+| 128K | 2,178 | 53.4 | – | – |
+| 240K | 2,212 (242,574 tokens) | 50.1 | 1,764 (242K) | – |
+
+- **30 GiB share:** no memory cap, 262,144-token context, 8-bit K/V with 32,768 tokens on the card, 4 parallel slots.
+  The engine's peak was 42.8 GB. The model is 111 GB, so on a 96 GB machine part of it is always read from the SSD.
+- **28 GB limit** (`configs/strata-r9700-q4.json`): a systemd scope with `MemoryMax=28G`, `MemoryHigh=27G` and no
+  swap, a 6.5 GiB RAM share for the experts and 2 slots. The share is small so the worst case fits: the main session
+  and both slots each holding a full 262K conversation (about 3.6 GB each). Three conversations of about 242,000
+  tokens held at once took 25.1 GB (peak 25.5); with nothing long held, 15.1 GB.
 
 **UD-Q4_K_XL under a 32 GB cap**, 131K context, `STRATA_PF_FUSED_KQ=1`. Letting the conversation memory grow with each
 conversation frees RAM for the experts:
 
-| Experts in RAM | Conversation memory | 4K | 16K | Peak |
+| Experts in RAM | Conversation memory | 4K prompt | 16K prompt | Peak |
 | ---: | --- | ---: | ---: | ---: |
 | 15 GiB | pinned up front (before) | 572 | 1,730 | 31.3 GB |
 | 20 GiB | grows | 644 | 1,876 | 28.5 GB |
@@ -353,19 +371,7 @@ conversation frees RAM for the experts:
 At 20 GiB, a 96K prompt read at 1,923 tokens/s and the peak rose to 30.0 GB. Leave room for the conversations to grow:
 reaching the cap coincided with broken (non-finite) output twice.
 
-**UD-Q4_K_XL under a hard 28 GB limit** (`configs/strata-r9700-q4.json`): a systemd scope with `MemoryMax=28G`,
-`MemoryHigh=27G` and no swap, a 6.5 GiB RAM share for the experts and 2 slots. The share is small so the worst case
-fits: the main session and both slots each holding a full 262K conversation (about 3.6 GB each). Three conversations
-of about 242,000 tokens held at once took 25.1 GB (peak 25.5); with nothing long held, 15.1 GB.
-
-| Prompt size | Prompt | Writing |
-| ---: | ---: | ---: |
-| 1K | 153 | 31.4 |
-| 4K | 455 | 48.1 |
-| 16K | 1,511 | 50.1 |
-| 64K | 2,128 | 51.2 |
-| 242K | 1,764 | – |
-
+**Running under a memory limit:**
 - **Keep the engine clear of the limit itself.** Every time it reached a hard limit in these tests (at start-up under a
   22 GB cap, or pinning the full context up front under 32 GB), its output came out broken. `MemoryHigh` a little
   below `MemoryMax` makes the kernel drop the scope's file cache first.
